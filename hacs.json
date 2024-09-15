@@ -1,0 +1,10 @@
+{
+  "name": "PJM Sensor for HomeAssistant",
+  "description": "A Home Assistant integration to monitor PJM grid data.",
+  "filename": "ha_pjm_sensor",
+  "domains": ["sensor"],
+  "country": ["US"],
+  "homeassistant": "2021.6.0",
+  "iot_class": "cloud_polling",
+  "render_readme": true
+}
