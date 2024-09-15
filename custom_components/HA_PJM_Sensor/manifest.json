@@ -1,0 +1,10 @@
+{
+  "domain": "ha_pjm_sensor",
+  "name": "Home Assistant PJM Data Integration",
+  "documentation": "https://github.com/jabbauer/ha_pjm_sensor",
+  "requirements": ["aiohttp", "voluptuous"],
+  "dependencies": [],
+  "codeowners": ["@jabbauer"],
+  "version": "0.1.0",
+  "iot_class": "cloud_polling"
+}
