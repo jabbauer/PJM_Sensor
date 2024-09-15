@@ -1,5 +1,30 @@
-DOMAIN = "ha_pjm_sensor"
+"""The ha_pjm_sensor integration."""
+import logging
 
-async def async_setup(hass, config):
-    """Set up the PJM integration."""
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+
+from .const import DOMAIN
+
+_LOGGER = logging.getLogger(__name__)
+
+async def async_setup(hass: HomeAssistant, config: dict):
+    """Set up the HA PJM Sensor component."""
+    # No configuration in configuration.yaml
     return True
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
+    """Set up HA PJM Sensor from a config entry."""
+    hass.data.setdefault(DOMAIN, {})
+    # Forward the setup to sensor platform
+    hass.async_create_task(
+        hass.config_entries.async_forward_entry_setup(entry, "sensor")
+    )
+    return True
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
+    """Unload a config entry."""
+    unload_ok = await hass.config_entries.async_forward_entry_unload(entry, "sensor")
+    if unload_ok:
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+    return unload_ok
