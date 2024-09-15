@@ -24,7 +24,7 @@ class PJMSensorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="user",
             data_schema=vol.Schema({
-                vol.Required("api_key", default=""): str,
+                vol.Optional("api_key", default=""): str,
             }),
             description_placeholders={"title": "PJM Sensor API Key"},
         )
