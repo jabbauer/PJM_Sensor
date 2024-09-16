@@ -22,6 +22,16 @@ from homeassistant.const import (
 
 from .const import (
     DOMAIN,
+    SENSOR_TYPES,
+    ZONE_TO_PNODE_ID,
+    CONF_ZONAL_LMP_AVG,
+    CONF_ZONAL_LMP_5MIN,
+    CONF_INSTANTANEOUS_ZONE_LOAD,
+    CONF_INSTANTANEOUS_TOTAL_LOAD,
+    CONF_ZONE_LOAD_FORECAST,
+    CONF_TOTAL_LOAD_FORECAST,
+    CONF_ZONE_SHORT_FORECAST,
+    CONF_TOTAL_SHORT_FORECAST,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -37,52 +47,6 @@ DEFAULT_SCAN_INTERVAL_FORECAST = 3600  # seconds
 
 ICON_POWER = 'mdi:flash'
 
-CONF_INSTANTANEOUS_ZONE_LOAD = 'instantaneous_zone_load'
-CONF_INSTANTANEOUS_TOTAL_LOAD = 'instantaneous_total_load'
-CONF_ZONE_LOAD_FORECAST = 'zone_load_forecast'
-CONF_TOTAL_LOAD_FORECAST = 'total_load_forecast'
-CONF_ZONE_SHORT_FORECAST = 'zone_short_forecast'
-CONF_TOTAL_SHORT_FORECAST = 'total_short_forecast'
-CONF_ZONAL_LMP_AVG = 'zonal_lmp_avg'
-CONF_ZONAL_LMP_5MIN = 'zonal_lmp_5min'
-
-SENSOR_TYPES = {
-    CONF_INSTANTANEOUS_ZONE_LOAD: ["Zone Load", 'MW'],
-    CONF_INSTANTANEOUS_TOTAL_LOAD: ["PJM Total Load", 'MW'],
-    CONF_ZONE_LOAD_FORECAST: ["Load Forecast", 'MW'],
-    CONF_TOTAL_LOAD_FORECAST: ["PJM Total Load Forecast", 'MW'],
-    CONF_ZONE_SHORT_FORECAST: ["Zone 2HR Forecast", "MW"],
-    CONF_TOTAL_SHORT_FORECAST: ["PJM 2HR Forecast", "MW"],
-    CONF_ZONAL_LMP_AVG: ["Hourly Average Zonal LMP", '$/MWh'],
-    CONF_ZONAL_LMP_5MIN: ["5-min Zonal LMP", '$/MWh'],
-}
-
-ZONE_TO_PNODE_ID = {
-    'PJM-RTO': 1,
-    'MID-ATL/APS': 3,
-    'AECO': 51291,
-    'BGE': 51292,
-    'DPL': 51293,
-    'JCPL': 51295,
-    'METED': 51296,
-    'PECO': 51297,
-    'PEPCO': 51298,
-    'PPL': 51299,
-    'PENELEC': 51300,
-    'PSEG': 51301,
-    'RECO': 7633629,
-    'APS': 8394954,
-    'AEP': 8445784,
-    'COMED': 33092371,
-    'DAY': 34508503,
-    'DOM': 34964545,
-    'DUQ': 37737283,
-    'ATSI': 116013753,
-    'DEOK': 124076095,
-    'EKPC': 970242670,
-    'OVEC': 1709725933,
-}
-
 MIN_TIME_BETWEEN_UPDATES_INSTANTANEOUS = timedelta(seconds=300)
 MIN_TIME_BETWEEN_UPDATES_FORECAST = timedelta(seconds=3600)
 
@@ -90,21 +54,29 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     """Set up PJM sensors from a config entry."""
     config = config_entry.data
     subscription_key = config.get(CONF_API_KEY)
+    update_frequency = config.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_INSTANTANEOUS)
 
-    pjm_data = PJMData(async_get_clientsession(hass), subscription_key, config.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_INSTANTANEOUS))
-    await pjm_data.async_update()
+    pjm_data = PJMData(async_get_clientsession(hass), subscription_key, update_frequency)
+    # Removed: await pjm_data.async_update()
 
     sensors = []
-    monitored_variables = config.get('monitored_variables', [])
+    monitored_variables = config.get(CONF_MONITORED_VARIABLES, [])
 
     for variable in monitored_variables:
         sensor_type = variable['type']
         zone = variable.get(CONF_ZONE)
         name = variable.get(CONF_NAME)
 
-        if sensor_type in (CONF_INSTANTANEOUS_TOTAL_LOAD, CONF_ZONE_load_FORECAST, CONF_TOTAL_load_FORECAST,
-                           CONF_ZONE_SHORT_FORECAST, CONF_TOTAL_SHORT_FORECAST, CONF_ZONAL_LMP_AVG, CONF_ZONAL_LMP_5MIN):
-            if sensor_type == CONF_ZONAL_LMP_AVG or sensor_type == CONF_ZONAL_LMP_5MIN:
+        if sensor_type in (
+            CONF_INSTANTANEOUS_TOTAL_LOAD,
+            CONF_ZONE_LOAD_FORECAST,
+            CONF_TOTAL_LOAD_FORECAST,
+            CONF_ZONE_SHORT_FORECAST,
+            CONF_TOTAL_SHORT_FORECAST,
+            CONF_ZONAL_LMP_AVG,
+            CONF_ZONAL_LMP_5MIN,
+        ):
+            if sensor_type in (CONF_ZONAL_LMP_AVG, CONF_ZONAL_LMP_5MIN):
                 pnode_id = ZONE_TO_PNODE_ID.get(zone)
                 if not pnode_id:
                     _LOGGER.error("Invalid zone provided for LMP: %s", zone)
@@ -189,7 +161,6 @@ class PJMSensor(Entity):
                 await self.update_short_forecast()
             else:
                 await self.update_forecast()
-
         except (ValueError, KeyError):
             _LOGGER.error("Could not update status for %s", self._name)
         except AttributeError as err:
@@ -209,7 +180,6 @@ class PJMSensor(Entity):
     @Throttle(MIN_TIME_BETWEEN_UPDATES_FORECAST)
     async def update_forecast(self):
         forecast_data = await self._pjm_data.async_update_forecast(self._identifier)
-
         if forecast_data is not None:
             peak_forecast_load = max(forecast_data, key=lambda x: x["forecast_load_mw"])["forecast_load_mw"]
             self._state = peak_forecast_load
@@ -218,10 +188,8 @@ class PJMSensor(Entity):
     @Throttle(MIN_TIME_BETWEEN_UPDATES_INSTANTANEOUS)
     async def update_short_forecast(self):
         load, forecast_hour_ending = await self._pjm_data.async_update_short_forecast(self._identifier)
-
         if load is not None:
             self._state = load
-
         if forecast_hour_ending is not None:
             self._forecast_data = forecast_hour_ending
 
@@ -356,7 +324,7 @@ class PJMData:
                 sorted_data = sorted(
                     data,
                     key=lambda x: (-x.get("forecast_load_mw", 0), 
-                                   dt.strptime(x['forecast_datetime_ending_utc'], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc).astimezone())
+                                  dt.strptime(x['forecast_datetime_ending_utc'], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc).astimezone())
                 )
 
                 if not sorted_data:
@@ -378,12 +346,8 @@ class PJMData:
     async def async_update_lmp_avg(self, pnode_id):
         """Fetch hourly average LMP data."""
         now_utc = dt.now(timezone.utc)
-        current_minute = now_utc.minute
-        if current_minute < 5:
-            start_time_utc = (now_utc.replace(minute=4, second=0, microsecond=0) - timedelta(hours=1))
-        else:
-            start_time_utc = now_utc.replace(minute=4, second=0, microsecond=0)
-        time_string = start_time_utc.strftime('%m/%e/%Y %H:%Mto') + now_utc.strftime('%m/%e/%Y %H:%M')
+        start_time_utc = now_utc - timedelta(hours=1)
+        time_string = self._format_time_range(start_time_utc, now_utc)
 
         params = {
             'rowCount': '60',
