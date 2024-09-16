@@ -16,10 +16,8 @@ async def async_setup(hass: HomeAssistant, config: dict):
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     """Set up HA PJM Sensor from a config entry."""
     hass.data.setdefault(DOMAIN, {})
-    # Forward the setup to sensor platform
-    hass.async_create_task(
-        hass.config_entries.async_forward_entry_setup(entry, "sensor")
-    )
+    # Forward the setup to sensor platform using async_forward_entry_setups
+    await hass.config_entries.async_forward_entry_setups(entry, ["sensor"])
     return True
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
