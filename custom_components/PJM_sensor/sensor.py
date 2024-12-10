@@ -77,7 +77,7 @@ ZONE_TO_PNODE_ID = {
     'OVEC': 1709725933,
 }
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_devices: AddEntitiesCallback):
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback):
     """Set up the PJM sensor platform from config entry."""
     zone = entry.data["zone"]
     selected_sensors = entry.data["sensors"]
@@ -104,9 +104,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_d
                 pjm_data, sensor_type,
                 identifier, None))
 
-    async_add_devices(dev, True)
+    async_add_entities(dev, True)
 
-class PJMSensor(Entity):
+class PJMSensor(SensorEntity):
     """Implementation of a PJM sensor."""
 
     def __init__(self, pjm_data, sensor_type, identifier, name):
