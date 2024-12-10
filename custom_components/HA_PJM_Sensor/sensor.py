@@ -4,90 +4,107 @@ Support for PJM data.
 import asyncio
 from datetime import datetime as dt, date, time, timezone, timedelta
 import logging
-
 import aiohttp
 import async_timeout
-import voluptuous as vol
 import urllib.parse
 
-from homeassistant.helpers.entity import Entity
+from homeassistant.components.sensor import SensorEntity
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_NAME
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import Throttle
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.util import Throttle
-from homeassistant.const import (
-    CONF_API_KEY,
-    CONF_NAME,
-    CONF_ZONE,
-    CONF_SCAN_INTERVAL,
-)
-
-from .const import (
-    DOMAIN,
-    SENSOR_TYPES,
-    ZONE_TO_PNODE_ID,
-    CONF_ZONAL_LMP_AVG,
-    CONF_ZONAL_LMP_5MIN,
-    CONF_INSTANTANEOUS_ZONE_LOAD,
-    CONF_INSTANTANEOUS_TOTAL_LOAD,
-    CONF_ZONE_LOAD_FORECAST,
-    CONF_TOTAL_LOAD_FORECAST,
-    CONF_ZONE_SHORT_FORECAST,
-    CONF_TOTAL_SHORT_FORECAST,
-)
 
 _LOGGER = logging.getLogger(__name__)
 
 RESOURCE_INSTANTANEOUS = 'https://api.pjm.com/api/v1/inst_load'
-RESOURCE_SHORT_FORECAST = 'https://api.pjm.com/api/v1/very_short_load_frcst'
 RESOURCE_FORECAST = 'https://api.pjm.com/api/v1/load_frcstd_7_day'
+RESOURCE_SHORT_FORECAST = 'https://api.pjm.com/api/v1/very_short_load_frcst'
 RESOURCE_LMP = 'https://api.pjm.com/api/v1/rt_unverified_fivemin_lmps'
+RESOURCE_SUBSCRIPTION_KEY = 'https://dataminer2.pjm.com/config/settings.json'
 
 # Default update frequencies
-DEFAULT_SCAN_INTERVAL_INSTANTANEOUS = 300  # seconds
-DEFAULT_SCAN_INTERVAL_FORECAST = 3600  # seconds
-
-ICON_POWER = 'mdi:flash'
-
 MIN_TIME_BETWEEN_UPDATES_INSTANTANEOUS = timedelta(seconds=300)
 MIN_TIME_BETWEEN_UPDATES_FORECAST = timedelta(seconds=3600)
 
-async def async_setup_entry(hass, config_entry, async_add_entities):
-    """Set up PJM sensors from a config entry."""
-    config = config_entry.data
-    subscription_key = config.get(CONF_API_KEY)
-    update_frequency = config.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_INSTANTANEOUS)
+PJM_RTO_ZONE = "PJM RTO"
+FORECAST_COMBINED_ZONE = 'RTO_COMBINED'
 
-    pjm_data = PJMData(async_get_clientsession(hass), subscription_key, update_frequency)
-    # Removed: await pjm_data.async_update()
+ICON_POWER = 'mdi:flash'
 
-    sensors = []
-    monitored_variables = config.get(CONF_MONITORED_VARIABLES, [])
+CONF_INSTANTANEOUS_ZONE_LOAD = 'instantaneous_zone_load'
+CONF_INSTANTANEOUS_TOTAL_LOAD = 'instantaneous_total_load'
+CONF_ZONE_LOAD_FORECAST = 'zone_load_forecast'
+CONF_TOTAL_LOAD_FORECAST = 'total_load_forecast'
+CONF_ZONE_SHORT_FORECAST = 'zone_short_forecast'
+CONF_TOTAL_SHORT_FORECAST = 'total_short_forecast'
+CONF_ZONAL_LMP = 'zonal_lmp'
 
-    for variable in monitored_variables:
-        sensor_type = variable['type']
-        zone = variable.get(CONF_ZONE)
-        name = variable.get(CONF_NAME)
+SENSOR_TYPES = {
+    CONF_INSTANTANEOUS_ZONE_LOAD: [" Zone Load", 'MW'],
+    CONF_INSTANTANEOUS_TOTAL_LOAD: ["PJM System Load", 'MW'],
+    CONF_ZONE_LOAD_FORECAST: ["Zone Forecast", 'MW'],
+    CONF_TOTAL_LOAD_FORECAST: ["PJM System Forecast", 'MW'],
+    CONF_ZONE_SHORT_FORECAST: ["Zone 2HR Forecast", "MW"],
+    CONF_TOTAL_SHORT_FORECAST: ["PJM 2HR Forecast", "MW"],
+    CONF_ZONAL_LMP: ["Zone LMP",'$/MWh'],
+}
 
-        if sensor_type in (
-            CONF_INSTANTANEOUS_TOTAL_LOAD,
-            CONF_ZONE_LOAD_FORECAST,
-            CONF_TOTAL_LOAD_FORECAST,
-            CONF_ZONE_SHORT_FORECAST,
-            CONF_TOTAL_SHORT_FORECAST,
-            CONF_ZONAL_LMP_AVG,
-            CONF_ZONAL_LMP_5MIN,
-        ):
-            if sensor_type in (CONF_ZONAL_LMP_AVG, CONF_ZONAL_LMP_5MIN):
-                pnode_id = ZONE_TO_PNODE_ID.get(zone)
-                if not pnode_id:
-                    _LOGGER.error("Invalid zone provided for LMP: %s", zone)
-                    continue
-                sensors.append(PJMSensor(pjm_data, sensor_type, pnode_id, name))
-            else:
-                sensors.append(PJMSensor(pjm_data, sensor_type, zone, name))
+ZONE_TO_PNODE_ID = {
+    'PJM-RTO': 1,
+    'MID-ATL/APS': 3,
+    'AECO': 51291,
+    'BGE': 51292,
+    'DPL': 51293,
+    'JCPL': 51295,
+    'METED': 51296,
+    'PECO': 51297,
+    'PEPCO': 51298,
+    'PPL': 51299,
+    'PENELEC': 51300,
+    'PSEG': 51301,
+    'RECO': 7633629,
+    'APS': 8394954,
+    'AEP': 8445784,
+    'COMED': 33092371,
+    'DAY': 34508503,
+    'DOM': 34964545,
+    'DUQ': 37737283,
+    'ATSI': 116013753,
+    'DEOK': 124076095,
+    'EKPC': 970242670,
+    'OVEC': 1709725933,
+}
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_devices: AddEntitiesCallback):
+    """Set up the PJM sensor platform from config entry."""
+    zone = entry.data["zone"]
+    selected_sensors = entry.data["sensors"]
+    pjm_data = PJMData(async_get_clientsession(hass))
+    dev = []
+
+    for sensor_type in selected_sensors:
+        identifier = zone
+        if sensor_type == CONF_INSTANTANEOUS_TOTAL_LOAD:
+            identifier = PJM_RTO_ZONE
+        if sensor_type in (CONF_TOTAL_LOAD_FORECAST, CONF_TOTAL_SHORT_FORECAST):
+            identifier = FORECAST_COMBINED_ZONE
+        
+        if sensor_type == CONF_ZONAL_LMP:
+            pnode_id = ZONE_TO_PNODE_ID.get(zone)
+            if pnode_id is None:
+                _LOGGER.error("Invalid zone provided for LMP: %s", zone)
+                continue
+            dev.append(PJMSensor(
+                pjm_data, sensor_type,
+                pnode_id, None))
         else:
-            _LOGGER.error("Unknown sensor type: %s", sensor_type)
+            dev.append(PJMSensor(
+                pjm_data, sensor_type,
+                identifier, None))
 
-    async_add_entities(sensors, True)
+    async_add_devices(dev, True)
 
 class PJMSensor(Entity):
     """Implementation of a PJM sensor."""
@@ -97,19 +114,25 @@ class PJMSensor(Entity):
         self._pjm_data = pjm_data
         self._type = sensor_type
         self._identifier = identifier
-        self._name = name if name else SENSOR_TYPES[sensor_type][0]
         self._unit_of_measurement = SENSOR_TYPES[sensor_type][1]
         self._state = None
         self._forecast_data = None
-        self._unique_id = f"{DOMAIN}_{sensor_type}_{identifier}"
 
-        # Customize the name based on sensor type
-        if sensor_type == CONF_ZONAL_LMP_AVG:
-            zone_name = next((zone for zone, id in ZONE_TO_PNODE_ID.items() if id == identifier), "Unknown Zone")
-            self._name = f"{zone_name} {SENSOR_TYPES[sensor_type][0]}"
-        elif sensor_type == CONF_ZONAL_LMP_5MIN:
-            zone_name = next((zone for zone, id in ZONE_TO_PNODE_ID.items() if id == identifier), "Unknown Zone")
-            self._name = f"{zone_name} {SENSOR_TYPES[sensor_type][0]}"
+        # Default name
+        if name:
+            self._name = name
+        else:
+            self._name = SENSOR_TYPES[sensor_type][0]
+            if sensor_type in (CONF_INSTANTANEOUS_ZONE_LOAD, CONF_ZONE_LOAD_FORECAST, CONF_ZONE_SHORT_FORECAST):
+                self._name = f'{identifier} {SENSOR_TYPES[sensor_type][0]}'
+            elif sensor_type == CONF_ZONAL_LMP:
+                zone_name = next((zone for zone, pid in ZONE_TO_PNODE_ID.items() if pid == identifier), None)
+                if zone_name:
+                    self._name = f'{zone_name} {SENSOR_TYPES[sensor_type][0]}'
+                else:
+                    self._name += ' ' + f'{identifier}'
+
+        self._attr_unique_id = f"pjm_{sensor_type}_{identifier}"
 
     @property
     def name(self):
@@ -127,7 +150,7 @@ class PJMSensor(Entity):
         return ICON_POWER
 
     @property
-    def state(self):
+    def native_value(self):
         """Return the state of the sensor."""
         return self._state
 
@@ -149,24 +172,22 @@ class PJMSensor(Entity):
         return attr
 
     async def async_update(self):
-        """Use the PJM data to set our state."""
+        """Update the sensor value."""
         try:
-            if self._type in [CONF_INSTANTANEOUS_ZONE_LOAD, CONF_INSTANTANEOUS_TOTAL_LOAD]:
+            if self._type in (CONF_INSTANTANEOUS_ZONE_LOAD, CONF_INSTANTANEOUS_TOTAL_LOAD):
                 await self.update_load()
-            elif self._type == CONF_ZONAL_LMP_AVG:
-                await self.update_lmp_avg()
-            elif self._type == CONF_ZONAL_LMP_5MIN:
-                await self.update_lmp_5min()
-            elif self._type in [CONF_TOTAL_SHORT_FORECAST, CONF_ZONE_SHORT_FORECAST]:
+            elif self._type == CONF_ZONAL_LMP:
+                await self.update_lmp()
+            elif self._type in (CONF_TOTAL_SHORT_FORECAST, CONF_ZONE_SHORT_FORECAST):
                 await self.update_short_forecast()
             else:
                 await self.update_forecast()
+
         except (ValueError, KeyError):
             _LOGGER.error("Could not update status for %s", self._name)
         except AttributeError as err:
             _LOGGER.error("Could not update status for PJM: %s", err)
         except TypeError:
-            # Possibly throttled update; ignore
             pass
         except Exception as err:
             _LOGGER.error("Unknown error for PJM: %s", err)
@@ -194,25 +215,18 @@ class PJMSensor(Entity):
             self._forecast_data = forecast_hour_ending
 
     @Throttle(MIN_TIME_BETWEEN_UPDATES_INSTANTANEOUS)
-    async def update_lmp_avg(self):
-        lmp_avg = await self._pjm_data.async_update_lmp_avg(self._identifier)
-        if lmp_avg is not None:
-            self._state = lmp_avg
-
-    @Throttle(MIN_TIME_BETWEEN_UPDATES_INSTANTANEOUS)
-    async def update_lmp_5min(self):
-        lmp_5min = await self._pjm_data.async_update_lmp_5min(self._identifier)
-        if lmp_5min is not None:
-            self._state = lmp_5min
+    async def update_lmp(self):
+        lmp = await self._pjm_data.async_update_lmp(self._identifier)
+        if lmp is not None:
+            self._state = lmp
 
 class PJMData:
     """Get and parse data from PJM."""
 
-    def __init__(self, websession, subscription_key, scan_interval):
+    def __init__(self, websession):
         """Initialize the data object."""
         self._websession = websession
-        self._subscription_key = subscription_key
-        self._scan_interval = scan_interval
+        self._subscription_key = None
 
     def _get_headers(self):
         headers = {
@@ -221,8 +235,27 @@ class PJMData:
         }
         return headers
 
+    async def _get_subscription_key(self):
+        _LOGGER.info("Attempting to get subscription key")
+        try:
+            with async_timeout.timeout(60):
+                response = await self._websession.get(RESOURCE_SUBSCRIPTION_KEY)
+                data = await response.json()
+                self._subscription_key = data['subscriptionKey']
+                if self._subscription_key:
+                    _LOGGER.info("Got subscription key")
+        except Exception as err:
+            _LOGGER.error("Could not get PJM subscription key: %s", err)
+    
     async def async_update_instantaneous(self, zone):
+        if not self._subscription_key:
+            await self._get_subscription_key()
+        
         """Fetch instantaneous load data."""
+        end_time_utc = dt.now().astimezone(timezone.utc)
+        start_time_utc = end_time_utc - timedelta(minutes=10)
+        time_string = start_time_utc.strftime('%m/%e/%Y %H:%Mto') + end_time_utc.strftime('%m/%e/%Y %H:%M')
+
         params = {
             'rowCount': '100',
             'sort': 'datetime_beginning_utc',
@@ -230,9 +263,9 @@ class PJMData:
             'startRow': '1',
             'isActiveMetadata': 'true',
             'fields': 'area,instantaneous_load',
-            'datetime_beginning_utc': self._get_time_range(minutes=10),
+            'datetime_beginning_utc': time_string,
         }
-        resource = f"{RESOURCE_INSTANTANEOUS}?{urllib.parse.urlencode(params)}"
+        resource = "{}?{}".format(RESOURCE_INSTANTANEOUS, urllib.parse.urlencode(params))
         headers = self._get_headers()
 
         try:
@@ -244,11 +277,11 @@ class PJMData:
                     _LOGGER.error("No load data returned for zone %s", zone)
                     return None
 
-                items = data.get("items", [])
+                items = data["items"]
 
                 for item in items:
-                    if item.get("area") == zone:
-                        return int(round(item.get("instantaneous_load", 0)))
+                    if item["area"] == zone:
+                        return int(round(item["instantaneous_load"]))
 
                 _LOGGER.error("Couldn't find load data for zone %s", zone)
                 return None
@@ -261,11 +294,15 @@ class PJMData:
             return None
 
     async def async_update_forecast(self, zone):
+        if not self._subscription_key:
+            await self._get_subscription_key()
+        
         """Fetch load forecast data."""
         midnight_local = dt.combine(date.today(), time())
         start_time_utc = midnight_local.astimezone(timezone.utc)
         end_time_utc = start_time_utc + timedelta(hours=23, minutes=59)
-        time_string = self._format_time_range(start_time_utc, end_time_utc)
+        time_string = start_time_utc.strftime('%m/%e/%Y %H:%Mto') + end_time_utc.strftime('%m/%e/%Y %H:%M')
+
 
         params = {
             'rowCount': '100',
@@ -276,21 +313,21 @@ class PJMData:
             'forecast_datetime_beginning_utc': time_string,
             'forecast_area': zone,
         }
-        resource = f"{RESOURCE_FORECAST}?{urllib.parse.urlencode(params)}"
+        resource = "{}?{}".format(RESOURCE_FORECAST, urllib.parse.urlencode(params))
         headers = self._get_headers()
 
         try:
             with async_timeout.timeout(60):
                 response = await self._websession.get(resource, headers=headers)
                 full_data = await response.json()
-                data = full_data.get("items", [])
+                data = full_data["items"]
 
                 forecast_data = []
                 for item in data:
-                    forecast_hour_ending = dt.strptime(item['forecast_datetime_ending_utc'], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc).astimezone()
+                    forecast_hour_ending = dt.strptime(item['forecast_datetime_ending_utc'], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc).astimezone(None)
                     forecast_data.append({
                         "forecast_hour_ending": forecast_hour_ending,
-                        "forecast_load_mw": int(item.get("forecast_load_mw", 0))
+                        "forecast_load_mw": int(item["forecast_load_mw"])
                     })
 
                 return forecast_data
@@ -303,6 +340,9 @@ class PJMData:
             return None
 
     async def async_update_short_forecast(self, zone):
+        if not self._subscription_key:
+            await self._get_subscription_key()
+        
         """Fetch short-term load forecast data."""
         params = {
             'rowCount': '48',
@@ -312,29 +352,29 @@ class PJMData:
             'evaluated_at_ept': '5MinutesAgo',
             'forecast_area': zone,
         }
-        resource = f"{RESOURCE_SHORT_FORECAST}?{urllib.parse.urlencode(params)}"
+        resource = "{}?{}".format(RESOURCE_SHORT_FORECAST, urllib.parse.urlencode(params))
         headers = self._get_headers()
 
         try:
             with async_timeout.timeout(60):
                 response = await self._websession.get(resource, headers=headers)
                 full_data = await response.json()
-                data = full_data.get("items", [])
+                data = full_data["items"]
 
                 sorted_data = sorted(
-                    data,
-                    key=lambda x: (-x.get("forecast_load_mw", 0), 
-                                  dt.strptime(x['forecast_datetime_ending_utc'], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc).astimezone())
+                    data, 
+                    key=lambda x: (
+                        x["forecast_load_mw"] * -1, 
+                        dt.strptime(x['forecast_datetime_ending_utc'],'%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc).astimezone(None)
+                    )
                 )
 
-                if not sorted_data:
-                    _LOGGER.error("No short forecast data available for zone %s", zone)
-                    return (None, None)
-
-                top_item = sorted_data[0]
-                load = int(top_item.get("forecast_load_mw", 0))
-                forecast_hour_ending = dt.strptime(top_item['forecast_datetime_ending_utc'], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc).astimezone()
-                return (load, forecast_hour_ending)
+                if sorted_data:
+                    load = int(sorted_data[0]["forecast_load_mw"])
+                    forecast_hour_ending = dt.strptime(sorted_data[0]['forecast_datetime_ending_utc'],'%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc).astimezone(None)
+                    unix_time = forecast_hour_ending.timestamp()
+                    return (load, unix_time)
+                return (None, None)
 
         except (asyncio.TimeoutError, aiohttp.ClientError) as err:
             _LOGGER.error("Could not get short forecast data from PJM: %s", err)
@@ -343,38 +383,44 @@ class PJMData:
             _LOGGER.error("Unexpected error fetching short forecast data: %s", err)
             return (None, None)
 
-    async def async_update_lmp_avg(self, pnode_id):
+    async def async_update_lmp(self, pnode_id):
+        if not self._subscription_key:
+            await self._get_subscription_key()
+        
         """Fetch hourly average LMP data."""
-        now_utc = dt.now(timezone.utc)
-        start_time_utc = now_utc - timedelta(hours=1)
-        time_string = self._format_time_range(start_time_utc, now_utc)
+        now_utc = dt.now().astimezone(timezone.utc)
+        current_minute = now_utc.minute
+        if current_minute < 5:
+            start_time_utc = (now_utc.replace(minute=4, second=0, microsecond=0) - timedelta(hours=1))
+        else:
+            start_time_utc = now_utc.replace(minute=4, second=0, microsecond=0)
+        time_string = start_time_utc.strftime('%m/%e/%Y %H:%Mto') + now_utc.strftime('%m/%e/%Y %H:%M')
 
         params = {
-            'rowCount': '60',
+            'rowCount': '12',
             'order': 'Asc',
             'startRow': '1',
             'datetime_beginning_utc': time_string,
             'pnode_id': pnode_id,
         }
-        resource = f"{RESOURCE_LMP}?{urllib.parse.urlencode(params)}"
+        resource = "{}?{}".format(RESOURCE_LMP, urllib.parse.urlencode(params))
         headers = self._get_headers()
 
         try:
             with async_timeout.timeout(60):
                 response = await self._websession.get(resource, headers=headers)
                 data = await response.json()
-
+                
                 if not data:
                     _LOGGER.error("No LMP data returned for pnode_id %s", pnode_id)
                     return None
+                items = data["items"]
 
-                items = data.get("items", [])
-
-                total_lmp_values = [float(item.get("total_lmp_rt", 0)) for item in items if item.get("pnode_id") == pnode_id]
+                #Return hourly average of 5-min LMP
+                total_lmp_values = [float(item["total_lmp_rt"]) for item in items if item["pnode_id"] == pnode_id]
                 if not total_lmp_values:
                     _LOGGER.error("Couldn't find LMP data for pnode_id %s", pnode_id)
                     return None
-
                 average_lmp = sum(total_lmp_values) / len(total_lmp_values)
                 return round(average_lmp, 2)
 
@@ -384,59 +430,3 @@ class PJMData:
         except Exception as err:
             _LOGGER.error("Unexpected error fetching LMP avg data: %s", err)
             return None
-
-    async def async_update_lmp_5min(self, pnode_id):
-        """Fetch 5-minute LMP data."""
-        now_utc = dt.now(timezone.utc)
-        current_minute = now_utc.minute
-        if current_minute < 5:
-            start_time_utc = (now_utc.replace(minute=0, second=0, microsecond=0) - timedelta(minutes=5))
-        else:
-            start_time_utc = now_utc.replace(minute=(current_minute // 5) * 5, second=0, microsecond=0)
-        time_string = self._format_time_range(start_time_utc, now_utc)
-
-        params = {
-            'rowCount': '12',
-            'order': 'Asc',
-            'startRow': '1',
-            'datetime_beginning_utc': time_string,
-            'pnode_id': pnode_id,
-        }
-        resource = f"{RESOURCE_LMP}?{urllib.parse.urlencode(params)}"
-        headers = self._get_headers()
-
-        try:
-            with async_timeout.timeout(60):
-                response = await self._websession.get(resource, headers=headers)
-                data = await response.json()
-
-                if not data:
-                    _LOGGER.error("No LMP data returned for pnode_id %s", pnode_id)
-                    return None
-
-                items = data.get("items", [])
-                lmp_values = [float(item.get("total_lmp_rt", 0)) for item in items if item.get("pnode_id") == pnode_id]
-
-                if not lmp_values:
-                    _LOGGER.error("Couldn't find LMP data for pnode_id %s", pnode_id)
-                    return None
-
-                latest_lmp = lmp_values[-1]  # Get the most recent 5-min LMP
-                return round(latest_lmp, 2)
-
-        except (asyncio.TimeoutError, aiohttp.ClientError) as err:
-            _LOGGER.error("Could not get LMP 5-min data from PJM: %s", err)
-            return None
-        except Exception as err:
-            _LOGGER.error("Unexpected error fetching LMP 5-min data: %s", err)
-            return None
-
-    def _get_time_range(self, minutes=10):
-        """Generate time range string for API queries."""
-        end_time_utc = dt.now(timezone.utc)
-        start_time_utc = end_time_utc - timedelta(minutes=minutes)
-        return f"{start_time_utc.strftime('%m/%e/%Y %H:%M')}to{end_time_utc.strftime('%m/%e/%Y %H:%M')}"
-
-    def _format_time_range(self, start, end):
-        """Format time range for API queries."""
-        return f"{start.strftime('%m/%e/%Y %H:%M')}to{end.strftime('%m/%e/%Y %H:%M')}"
