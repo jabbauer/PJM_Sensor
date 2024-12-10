@@ -18,10 +18,10 @@ Type: Integration
 4. Under Settings, Devices and Services - Add Integration: PJM Sensor
 5. Select your utility Zone
 6. Select which sensor entities to enable:
-   - Zonal Instantaneous Load, current zonal load
-   - System Instantaneous Load, current PJM systemwide load
-   - Zonal Daily Forecast, Peak forecast for selected zone for day
-   - System Daily Forecast, Peak forecast for PJM system for day
-   - Zonal 2Hr Forecast, Peak forecast for selected Zone in future 2Hr window
-   - System 2Hr Forecast, Peak forecast for PJM system in future 2Hr window
-   - Zonal LMP, Locational Marginal Price ($/MWh) for selected zone
+   - Zonal Instantaneous Load - current zonal load
+   - System Instantaneous Load - current PJM systemwide load
+   - Zonal Daily Forecast - Peak forecast for selected zone for day
+   - System Daily Forecast - Peak forecast for PJM system for day
+   - Zonal 2Hr Forecast - Peak forecast for selected Zone in future 2Hr window
+   - System 2Hr Forecast - Peak forecast for PJM system in future 2Hr window
+   - Zonal LMP - Locational Marginal Price ($/MWh) for selected zone
