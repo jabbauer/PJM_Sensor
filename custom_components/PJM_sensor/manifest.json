@@ -2,7 +2,7 @@
   "domain": "pjm",
   "name": "PJM Sensor",
   "version": "0.1.0",
-  "documentation": "https://github.com/jabbauer/ha_pjm_sensor",
+  "documentation": "https://github.com/jabbauer/PJM_sensor",
   "requirements": ["aiohttp", "async_timeout", "voluptuous"],
   "dependencies": [],
   "codeowners": ["@jabbauer"],
