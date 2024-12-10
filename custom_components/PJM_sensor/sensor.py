@@ -111,35 +111,49 @@ class PJMSensor(SensorEntity):
 
     def __init__(self, pjm_data, sensor_type, identifier, name):
         """Initialize the sensor."""
+        super().__init__()  # Important: call the parent class initializer
+        
         self._pjm_data = pjm_data
         self._type = sensor_type
         self._identifier = identifier
         self._unit_of_measurement = SENSOR_TYPES[sensor_type][1]
+        #self._unique_id = f"sensor.pjm_{sensor_type}_{identifier}"  # Generate a unique ID
+        self._attr_unique_id = f"pjm_{sensor_type}_{identifier}"
         self._state = None
         self._forecast_data = None
 
         # Default name
         if name:
-            self._name = name
+            self._attr_name = name
         else:
-            self._name = SENSOR_TYPES[sensor_type][0]
+            self._attr_name = SENSOR_TYPES[sensor_type][0]
             if sensor_type in (CONF_INSTANTANEOUS_ZONE_LOAD, CONF_ZONE_LOAD_FORECAST, CONF_ZONE_SHORT_FORECAST):
-                self._name = f'{identifier} {SENSOR_TYPES[sensor_type][0]}'
+                self._attr_name = f'{identifier} {SENSOR_TYPES[sensor_type][0]}'
             elif sensor_type == CONF_ZONAL_LMP:
                 zone_name = next((zone for zone, pid in ZONE_TO_PNODE_ID.items() if pid == identifier), None)
                 if zone_name:
-                    self._name = f'{zone_name} {SENSOR_TYPES[sensor_type][0]}'
+                    self._attr_name = f'{zone_name} {SENSOR_TYPES[sensor_type][0]}'
                 else:
-                    self._name += ' ' + f'{identifier}'
+                    self._attr_name += ' ' + f'{identifier}'
+    @property
+    def name(self):
+        """Return the name of the sensor."""
+        return self._attr_name
+    
+    @property
+    def unique_id(self):
+        """Return a unique ID for the sensor."""
+        return self._attr_unique_id
 
-        self._attr_unique_id = f"pjm_{sensor_type}_{identifier}"
-        self._attr_name = self._name
-        self._attr_native_unit_of_measurement = self._unit_of_measurement
-        
     @property
     def icon(self):
         """Icon to use in the frontend, if any."""
         return ICON_POWER
+
+    @property
+    def unit_of_measurement(self):
+        """Return the unit of measurement of this entity, if any."""
+        return self._unit_of_measurement
 
     @property
     def native_value(self):
