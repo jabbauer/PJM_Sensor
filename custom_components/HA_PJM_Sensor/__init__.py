@@ -1,28 +1,20 @@
-"""The ha_pjm_sensor integration."""
-import logging
+"""The PJM integration."""
+from __future__ import annotations
+
+import asyncio
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.const import Platform
 
-from .const import DOMAIN
+DOMAIN = "pjm"
+PLATFORMS = [Platform.SENSOR]
 
-_LOGGER = logging.getLogger(__name__)
-
-async def async_setup(hass: HomeAssistant, config: dict):
-    """Set up the HA PJM Sensor component."""
-    # No configuration in configuration.yaml
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up PJM from a config entry."""
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
-    """Set up HA PJM Sensor from a config entry."""
-    hass.data.setdefault(DOMAIN, {})
-    # Forward the setup to sensor platform using async_forward_entry_setups
-    await hass.config_entries.async_forward_entry_setups(entry, ["sensor"])
-    return True
-
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
-    """Unload a config entry."""
-    unload_ok = await hass.config_entries.async_forward_entry_unload(entry, "sensor")
-    if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id, None)
-    return unload_ok
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload PJM config entry."""
+    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
