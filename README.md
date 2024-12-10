@@ -10,14 +10,15 @@ Note that information and data contained in Data Miner is for internal use only 
 
 # Configuration:
 1. Under HACS Options, select custom repositories and add
-Repository: https://github.com/jabbauer/PJM_Sensor/tree/main
-Type: Integration
+   - Repository: https://github.com/jabbauer/PJM_Sensor/tree/main
+   - Type: Integration
 
-2. Search and Download: PJM Sensor for HomeAssistant
-3. Restart Home Assistant
-4. Under Settings, Devices and Services - Add Integration: PJM Sensor
-5. Select your utility Zone
-6. Select which sensor entities to enable:
+3. Search and Download: PJM Sensor for HomeAssistant
+4. Restart Home Assistant
+5. Under Settings, Devices and Services
+   - Add Integration: PJM Sensor
+6. Select your utility Zone
+7. Select which sensor entities to enable:
    - Zonal Instantaneous Load - current zonal load
    - System Instantaneous Load - current PJM systemwide load
    - Zonal Daily Forecast - Peak forecast for selected zone for day
