@@ -1,4 +1,7 @@
 # PJM Sensor
+
+[![hacs_badge](https://img.shields.io/badge/HACS-Default-orange.svg?style=for-the-badge)](https://github.com/custom-components/hacs)
+
 A Home Assistant Integration that enables PJM sensors - useful for monitoring zonal wholesale energy prices, performing Demand Response, or managing capacity charges through detecting coincident system peaks.
 
 Without an API key, users are limited to 6 requests per minute. PJM members are limited to 600 requests per minute.
