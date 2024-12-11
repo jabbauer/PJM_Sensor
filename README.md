@@ -2,7 +2,7 @@
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Default-orange.svg?style=for-the-badge)](https://github.com/custom-components/hacs)
 
-A Home Assistant Integration that enables PJM sensors - useful for monitoring zonal wholesale energy prices, performing Demand Response, or managing capacity charges through detecting coincident system peaks.
+A Home Assistant Integration that enables PJM sensors - useful for monitoring zonal wholesale energy prices, performing Demand Response, or managing capacity charges through detecting coincident system peaks. Calls on PJM's DataMiner 2 API for data access.
 
 Without an API key, users are limited to 6 requests per minute. PJM members are limited to 600 requests per minute.
 
@@ -29,3 +29,6 @@ Note that information and data contained in Data Miner is for internal use only 
    - Zonal 2Hr Forecast - Peak forecast for selected Zone in future 2Hr window
    - System 2Hr Forecast - Peak forecast for PJM system in future 2Hr window
    - Zonal LMP - Locational Marginal Price ($/MWh) for selected zone
+
+# Disclaimer
+This integration is not affiliated with nor supported by PJM, or any PJM member.
