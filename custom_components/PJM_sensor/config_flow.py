@@ -34,13 +34,19 @@ ZONE_TO_PNODE_ID = {
 }
 
 SENSOR_OPTIONS = {
-    "instantaneous_zone_load": "Zonal Instantaneous Load",
     "instantaneous_total_load": "System Instantaneous Load",
-    "zone_load_forecast": "Zonal Daily Forecast",
-    "total_load_forecast": "System Daily Forecast",
-    "zone_short_forecast": "Zonal 2Hr Forecast",
     "total_short_forecast": "System 2Hr Forecast",
+    "total_load_forecast": "System Daily Forecast",
+    "instantaneous_zone_load": "Zonal Instantaneous Load",
+    "zone_short_forecast": "Zonal 2Hr Forecast",
+    "zone_load_forecast": "Zonal Daily Forecast",
     "zonal_lmp": "Zonal LMP"
+}
+
+SYSTEM_SENSORS = {
+    "instantaneous_total_load",
+    "total_short_forecast",
+    "total_load_forecast",
 }
 
 class PJMConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -91,14 +97,10 @@ class PJMConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             vol.Required("zone", default=defaults.get("zone")): vol.In(self.zone_list)
         }
         
-        # Add a checkbox for each sensor (default all checked)
+        # Add checkboxes for sensors, system sensors selected by default
         for sensor_id, sensor_label in SENSOR_OPTIONS.items():
-            schema[
-                vol.Optional(
-                    sensor_id,
-                    default=defaults.get(sensor_id, True)  # Default all sensors selected
-                )
-            ] = bool
+            default_value = defaults.get(sensor_id, sensor_id in SYSTEM_SENSORS)
+            schema[vol.Optional(sensor_id, default=default_value)] = bool
         
         return vol.Schema(schema)
 
@@ -162,11 +164,6 @@ class PJMOptionsFlowHandler(config_entries.OptionsFlow):
         }
         
         for sensor_id, sensor_label in SENSOR_OPTIONS.items():
-            schema[
-                vol.Optional(
-                    sensor_id,
-                    default=sensor_id in sensors  # Preserve existing selections
-                )
-            ] = bool
+            schema[vol.Optional(sensor_id, default=sensor_id in sensors)] = bool
         
         return vol.Schema(schema)
