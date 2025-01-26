@@ -19,13 +19,14 @@ Note that information and data contained in Data Miner is for internal use only 
    - Add Integration: PJM Sensor
 6. Select your utility Zone
 7. Select which sensor entities to enable:
-   - Zonal Instantaneous Load - current zonal load
-   - System Instantaneous Load - current PJM systemwide load (
-   - Zonal Daily Forecast - Peak forecast for selected zone for day
-   - System Daily Forecast - Peak forecast for PJM system for day
-   - Zonal 2Hr Forecast - Peak forecast for selected Zone in future 2Hr window
-   - System 2Hr Forecast - Peak forecast for PJM system in future 2Hr window
-   - Zonal LMP - Hourly Average Locational Marginal Price ($/MWh) for selected zone
+   
+   - instantaneous_total_load - PJM Instantaneous Load, 5 minute update interval
+   - total_short_forecast - PJM 2Hr Forecast, 5 minute update interval
+   - total_load_forecast - PJM Daily Forecast
+   - instantaneous_zone_load - Zonal Instantaneous Load, 5 minute update interval
+   - zone_short_forecast - Zonal 2Hr Forecast, 5 minute update interval
+   - zone_load_forecast - Zonal Daily Forecast
+   - zonal_lmp - Hourly Average Locational Marginal Price ($/MWh) for selected zone
 
 # Disclaimer
 This integration is not affiliated with nor supported by PJM, or any PJM member.
