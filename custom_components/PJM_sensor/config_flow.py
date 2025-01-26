@@ -51,37 +51,56 @@ class PJMConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     zone_list = sorted(ZONE_TO_PNODE_ID.keys())
 
     async def async_step_user(self, user_input=None) -> FlowResult:
-        """Handle the initial step."""
+        """Handle the configuration in a single step."""
         errors = {}
 
         if user_input is not None:
-            # Store selected zone and move to the next step
-            self.entry_data["zone"] = user_input["zone"]
-            return await self.async_step_sensors()
-
-        return self.async_show_form(
-            step_id="user",
-            data_schema=vol.Schema({
-                vol.Required("zone", default="PJM-RTO"): vol.In(self.zone_list),
-            }),
-            errors=errors
-        )
-
-    async def async_step_sensors(self, user_input=None) -> FlowResult:
-        """Select which sensors to enable."""
-        errors = {}
-
-        if user_input is not None:
-            self.entry_data["sensors"] = user_input["sensors"]
+            # Collect selected sensors
+            selected_sensors = [
+                sensor_id 
+                for sensor_id in SENSOR_OPTIONS 
+                if user_input.get(sensor_id, False)
+            ]
+            
+            if not selected_sensors:
+                errors["base"] = "no_sensors_selected"
+                return self.async_show_form(
+                    step_id="user",
+                    data_schema=self._build_schema(user_input),
+                    errors=errors
+                )
+            
+            # Save configuration
+            self.entry_data = {
+                "zone": user_input["zone"],
+                "sensors": selected_sensors
+            }
             return self.async_create_entry(title="PJM Integration", data=self.entry_data)
 
+        # Build schema dynamically
         return self.async_show_form(
-            step_id="sensors",
-            data_schema=vol.Schema({
-                vol.Required("sensors", default=list(SENSOR_OPTIONS.keys())): cv.multi_select(SENSOR_OPTIONS)
-            }),
+            step_id="user",
+            data_schema=self._build_schema(),
             errors=errors
         )
+
+    def _build_schema(self, defaults=None):
+        """Build schema with zone dropdown and individual sensor checkboxes."""
+        defaults = defaults or {"zone": "PJM-RTO"}
+        schema = {
+            vol.Required("zone", default=defaults.get("zone")): vol.In(self.zone_list)
+        }
+        
+        # Add a checkbox for each sensor (default all checked)
+        for sensor_id, sensor_label in SENSOR_OPTIONS.items():
+            schema[
+                vol.Optional(
+                    sensor_id,
+                    default=defaults.get(sensor_id, True)  # Default all sensors selected
+                )
+            ] = bool
+        
+        return vol.Schema(schema)
 
     @staticmethod
     @callback
@@ -96,16 +115,58 @@ class PJMOptionsFlowHandler(config_entries.OptionsFlow):
         self.config_entry = config_entry
 
     async def async_step_init(self, user_input=None):
-        """Manage the PJM options."""
-        if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+        """Manage PJM options with checkboxes."""
+        errors = {}
+        current_sensors = self.config_entry.data.get("sensors", [])
+        current_zone = self.config_entry.data.get("zone", "PJM-RTO")
 
-        sensors = self.config_entry.data.get("sensors", [])
-        zone = self.config_entry.data.get("zone", "PJM-RTO")
+        if user_input is not None:
+            selected_sensors = [
+                sensor_id 
+                for sensor_id in SENSOR_OPTIONS 
+                if user_input.get(sensor_id, False)
+            ]
+            
+            if not selected_sensors:
+                errors["base"] = "no_sensors_selected"
+                return self.async_show_form(
+                    step_id="init",
+                    data_schema=self._build_schema(user_input),
+                    errors=errors
+                )
+            
+            # Update configuration
+            updated_data = {**self.config_entry.data}
+            updated_data.update({
+                "zone": user_input["zone"],
+                "sensors": selected_sensors
+            })
+            self.hass.config_entries.async_update_entry(
+                self.config_entry,
+                data=updated_data
+            )
+            return self.async_create_entry(title="", data={})
+
+        # Build schema with current selections
         return self.async_show_form(
             step_id="init",
-            data_schema=vol.Schema({
-                vol.Required("zone", default=zone): vol.In(sorted(ZONE_TO_PNODE_ID.keys())),
-                vol.Required("sensors", default=sensors): cv.multi_select(SENSOR_OPTIONS)
-            })
+            data_schema=self._build_schema(current_zone, current_sensors),
+            errors=errors
         )
+
+    def _build_schema(self, zone, sensors=None):
+        """Build schema with checkboxes reflecting current selections."""
+        sensors = sensors or []
+        schema = {
+            vol.Required("zone", default=zone): vol.In(sorted(ZONE_TO_PNODE_ID.keys()))
+        }
+        
+        for sensor_id, sensor_label in SENSOR_OPTIONS.items():
+            schema[
+                vol.Optional(
+                    sensor_id,
+                    default=sensor_id in sensors  # Preserve existing selections
+                )
+            ] = bool
+        
+        return vol.Schema(schema)
