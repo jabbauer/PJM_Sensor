@@ -31,8 +31,6 @@ MIN_TIME_BETWEEN_UPDATES_FORECAST = timedelta(seconds=3600)
 PJM_RTO_ZONE = "PJM RTO"
 FORECAST_COMBINED_ZONE = 'RTO_COMBINED'
 
-ICON_POWER = 'mdi:flash'
-
 CONF_INSTANTANEOUS_ZONE_LOAD = 'instantaneous_zone_load'
 CONF_INSTANTANEOUS_TOTAL_LOAD = 'instantaneous_total_load'
 CONF_ZONE_LOAD_FORECAST = 'zone_load_forecast'
@@ -148,7 +146,22 @@ class PJMSensor(SensorEntity):
     @property
     def icon(self):
         """Icon to use in the frontend, if any."""
-        return ICON_POWER
+        if self._type in [
+            CONF_ZONE_LOAD_FORECAST,
+            CONF_TOTAL_LOAD_FORECAST,
+            CONF_ZONE_SHORT_FORECAST,
+            CONF_TOTAL_SHORT_FORECAST
+        ]:
+            return "mdi:chart-timeline-variant"
+        elif self._type in [
+            CONF_INSTANTANEOUS_ZONE_LOAD,
+            CONF_INSTANTANEOUS_TOTAL_LOAD
+        ]:
+            return "mdi:transmission-tower-export"
+        elif self._type == CONF_ZONAL_LMP:
+            return "mdi:meter-electric"
+        else:
+            return "mdi:flash"  # Default icon for other sensors
 
     @property
     def unit_of_measurement(self):
