@@ -106,14 +106,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 
     async_add_entities(dev, False)
 
-    # Schedule updates starting at 10s, then every 10s
+#    # Schedule updates starting at 10s, then every 10s
+#    for index, entity in enumerate(dev):
+#        delay = 10 + (index * 10)
+#        async_call_later(
+#            hass,
+#            delay,
+#            lambda _, e=entity: hass.async_create_task(e.async_update())
+#        )
+
+    # Schedule staggered updates using async tasks
     for index, entity in enumerate(dev):
         delay = 10 + (index * 10)
-        async_call_later(
-            hass,
-            delay,
-            lambda _, e=entity: hass.async_create_task(e.async_update())
+        hass.async_create_task(
+            schedule_delayed_update(entity, delay)
         )
+
+async def schedule_delayed_update(entity, delay):
+    """Schedule an update after a delay using async sleep."""
+    await asyncio.sleep(delay)
+    await entity.async_update()
 
 class PJMSensor(SensorEntity):
     """Implementation of a PJM sensor."""
