@@ -7,7 +7,7 @@ import logging
 import aiohttp
 import async_timeout
 import urllib.parse
-import time  # Added for rate limiting
+import time as time_module  # Added for rate limiting, time_module to avoid conflict with datetime above
 
 from homeassistant.helpers.event import async_call_later
 from homeassistant.components.sensor import SensorEntity
@@ -262,14 +262,14 @@ class PJMData:
     async def _rate_limit(self):
         """Enforce ≤6 API calls per minute."""
         async with self._lock:
-            now = time.time()
+            now = time_module.time()
             self._request_times = [t for t in self._request_times if now - t < 60]
             while len(self._request_times) >= 6:
                 oldest = self._request_times[0]
                 wait_time = 60 - (now - oldest) + 1
                 _LOGGER.debug("Rate limit reached. Waiting %.2f seconds.", wait_time)
                 await asyncio.sleep(wait_time)
-                now = time.time()
+                now = time_module.time()
                 self._request_times = [t for t in self._request_times if now - t < 60]
             self._request_times.append(now)
 
