@@ -7,7 +7,9 @@ import logging
 import aiohttp
 import async_timeout
 import urllib.parse
+import time as time_module  # Added for rate limiting, time_module to avoid conflict with datetime above
 
+from homeassistant.helpers.event import async_call_later
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_NAME
@@ -25,8 +27,8 @@ RESOURCE_LMP = 'https://api.pjm.com/api/v1/rt_unverified_fivemin_lmps'
 RESOURCE_SUBSCRIPTION_KEY = 'https://dataminer2.pjm.com/config/settings.json'
 
 # Default update frequencies
-MIN_TIME_BETWEEN_UPDATES_INSTANTANEOUS = timedelta(seconds=300)
-MIN_TIME_BETWEEN_UPDATES_FORECAST = timedelta(seconds=3600)
+MIN_TIME_BETWEEN_UPDATES_INSTANTANEOUS = timedelta(seconds=300) #5min for load, LMPs
+MIN_TIME_BETWEEN_UPDATES_FORECAST = timedelta(seconds=3600) #1hr for forecasts
 
 PJM_RTO_ZONE = "PJM RTO"
 FORECAST_COMBINED_ZONE = 'RTO_COMBINED'
@@ -102,15 +104,34 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
                 pjm_data, sensor_type,
                 identifier, None))
 
-    async_add_entities(dev, True)
+    async_add_entities(dev, False)
+
+#    # Schedule updates starting at 10s, then every 10s
+#    for index, entity in enumerate(dev):
+#        delay = 10 + (index * 10)
+#        async_call_later(
+#            hass,
+#            delay,
+#            lambda _, e=entity: hass.async_create_task(e.async_update())
+#        )
+
+    # Schedule staggered updates using async tasks
+    for index, entity in enumerate(dev):
+        delay = 10 + (index * 10)
+        hass.async_create_task(
+            schedule_delayed_update(entity, delay)
+        )
+
+async def schedule_delayed_update(entity, delay):
+    """Schedule an update after a delay using async sleep."""
+    await asyncio.sleep(delay)
+    await entity.async_update()
 
 class PJMSensor(SensorEntity):
     """Implementation of a PJM sensor."""
 
     def __init__(self, pjm_data, sensor_type, identifier, name):
-        """Initialize the sensor."""
         super().__init__()  # Important: call the parent class initializer
-        
         self._pjm_data = pjm_data
         self._type = sensor_type
         self._identifier = identifier
@@ -197,14 +218,8 @@ class PJMSensor(SensorEntity):
             else:
                 await self.update_forecast()
 
-        except (ValueError, KeyError):
-            _LOGGER.error("Could not update status for %s", self._name)
-        except AttributeError as err:
-            _LOGGER.error("Could not update status for PJM: %s", err)
-        except TypeError:
-            pass
         except Exception as err:
-            _LOGGER.error("Unknown error for PJM: %s", err)
+            _LOGGER.error("Update failed: %s", err)
 
     @Throttle(MIN_TIME_BETWEEN_UPDATES_INSTANTANEOUS)
     async def update_load(self):
@@ -241,6 +256,22 @@ class PJMData:
         """Initialize the data object."""
         self._websession = websession
         self._subscription_key = None
+        self._request_times = []
+        self._lock = asyncio.Lock()
+
+    async def _rate_limit(self):
+        """Enforce ≤6 API calls per minute."""
+        async with self._lock:
+            now = time_module.time()
+            self._request_times = [t for t in self._request_times if now - t < 60]
+            while len(self._request_times) >= 6:
+                oldest = self._request_times[0]
+                wait_time = 60 - (now - oldest) + 1
+                _LOGGER.debug("Rate limit reached. Waiting %.2f seconds.", wait_time)
+                await asyncio.sleep(wait_time)
+                now = time_module.time()
+                self._request_times = [t for t in self._request_times if now - t < 60]
+            self._request_times.append(now)
 
     def _get_headers(self):
         headers = {
@@ -250,21 +281,22 @@ class PJMData:
         return headers
 
     async def _get_subscription_key(self):
-        _LOGGER.info("Attempting to get subscription key")
+        """Fetch PJM API subscription key (rate-limited)."""
+        if self._subscription_key:
+            return
+
         try:
             with async_timeout.timeout(60):
                 response = await self._websession.get(RESOURCE_SUBSCRIPTION_KEY)
                 data = await response.json()
                 self._subscription_key = data['subscriptionKey']
-                if self._subscription_key:
-                    _LOGGER.info("Got subscription key")
         except Exception as err:
-            _LOGGER.error("Could not get PJM subscription key: %s", err)
+            _LOGGER.error("Failed to get subscription key: %s", err)
     
     async def async_update_instantaneous(self, zone):
+        await self._rate_limit()
         if not self._subscription_key:
             await self._get_subscription_key()
-        
         """Fetch instantaneous load data."""
         end_time_utc = dt.now().astimezone(timezone.utc)
         start_time_utc = end_time_utc - timedelta(minutes=10)
@@ -308,9 +340,9 @@ class PJMData:
             return None
 
     async def async_update_forecast(self, zone):
+        await self._rate_limit()
         if not self._subscription_key:
             await self._get_subscription_key()
-        
         """Fetch load forecast data."""
         midnight_local = dt.combine(date.today(), time())
         start_time_utc = midnight_local.astimezone(timezone.utc)
@@ -354,9 +386,9 @@ class PJMData:
             return None
 
     async def async_update_short_forecast(self, zone):
+        await self._rate_limit()
         if not self._subscription_key:
             await self._get_subscription_key()
-        
         """Fetch short-term load forecast data."""
         params = {
             'rowCount': '48',
@@ -398,9 +430,10 @@ class PJMData:
             return (None, None)
 
     async def async_update_lmp(self, pnode_id):
+        await self._rate_limit()
         if not self._subscription_key:
             await self._get_subscription_key()
-        
+
         """Fetch hourly average LMP data."""
         now_utc = dt.now().astimezone(timezone.utc)
         current_minute = now_utc.minute
