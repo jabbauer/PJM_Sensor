@@ -38,7 +38,8 @@ from .const import (
     CONF_ZONE_SHORT_FORECAST,
     CONF_TOTAL_SHORT_FORECAST,
     CONF_ZONAL_LMP,
-    CONF_COINCIDENT_PEAK_PREDICTION,
+    CONF_COINCIDENT_PEAK_PREDICTION_ZONE,
+    CONF_COINCIDENT_PEAK_PREDICTION_SYSTEM,
     CONF_PEAK_THRESHOLD,
     CONF_ACCURACY_THRESHOLD,
     DEFAULT_PEAK_THRESHOLD,
@@ -62,7 +63,7 @@ PJM_RTO_ZONE = "PJM RTO"
 FORECAST_COMBINED_ZONE = 'RTO_COMBINED'
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback):
-    """Set up the PJM sensor platform from config entry."""
+    """Set up the PJM sensor platform from a config entry."""
     zone = entry.data["zone"]
     selected_sensors = entry.data["sensors"]
     pjm_data = PJMData(async_get_clientsession(hass))
@@ -81,11 +82,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
                 _LOGGER.error("Invalid zone provided for LMP: %s", zone)
                 continue
             dev.append(PJMSensor(pjm_data, sensor_type, pnode_id, None))
-        elif sensor_type == CONF_COINCIDENT_PEAK_PREDICTION:
-            # Use user-provided thresholds (if any) or fall back to defaults.
+        elif sensor_type == CONF_COINCIDENT_PEAK_PREDICTION_ZONE:
+            # Use the configured zone (e.g., "COMED")
             peak_threshold = entry.data.get(CONF_PEAK_THRESHOLD, DEFAULT_PEAK_THRESHOLD)
             accuracy_threshold = entry.data.get(CONF_ACCURACY_THRESHOLD, DEFAULT_ACCURACY_THRESHOLD)
-            dev.append(CoincidentPeakPredictionSensor(pjm_data, zone, peak_threshold, accuracy_threshold))
+            dev.append(CoincidentPeakPredictionSensor(
+                pjm_data, zone, peak_threshold, accuracy_threshold, CONF_COINCIDENT_PEAK_PREDICTION_ZONE))
+        elif sensor_type == CONF_COINCIDENT_PEAK_PREDICTION_SYSTEM:
+            # Use the system mapping ("PJM RTO")
+            peak_threshold = entry.data.get(CONF_PEAK_THRESHOLD, DEFAULT_PEAK_THRESHOLD)
+            accuracy_threshold = entry.data.get(CONF_ACCURACY_THRESHOLD, DEFAULT_ACCURACY_THRESHOLD)
+            dev.append(CoincidentPeakPredictionSensor(
+                pjm_data, PJM_RTO_ZONE, peak_threshold, accuracy_threshold, CONF_COINCIDENT_PEAK_PREDICTION_SYSTEM))
         else:
             dev.append(PJMSensor(pjm_data, sensor_type, identifier, None))
 
@@ -95,6 +103,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     for index, entity in enumerate(dev):
         delay = 12 + (index * 12)
         hass.async_create_task(schedule_delayed_update(entity, delay))
+
 
 async def schedule_delayed_update(entity, delay):
     """Schedule an update after a delay using async sleep."""
@@ -218,27 +227,22 @@ class PJMSensor(SensorEntity):
 class CoincidentPeakPredictionSensor(SensorEntity):
     """
     This sensor predicts PJM system coincident peaks at the start of the hour.
-    
-    It uses real-time load data (fetched via the shared PJMData instance), tracks the load history,
-    performs derivative analysis, and fits a quadratic regression to predict the peak load and its arrival time.
-    
-    Only if the predicted peak load exceeds the threshold (the higher of the user-defined or the 5th highest historical peak)
-    and our rolling prediction accuracy is above the provided accuracy threshold will a peak be flagged.
+    It uses real-time load data (via the shared PJMData instance), tracks the load history,
+    and performs quadratic regression to forecast the peak.
     """
-    def __init__(self, pjm_data, zone, peak_threshold, accuracy_threshold):
+    def __init__(self, pjm_data, zone, peak_threshold, accuracy_threshold, sensor_type):
         self._pjm_data = pjm_data
         self._zone = zone
+        self._sensor_type = sensor_type  # New parameter to indicate which type this is.
         self._attr_name = f"Coincident Peak Prediction ({zone})"
-        self._attr_unique_id = f"pjm_{CONF_COINCIDENT_PEAK_PREDICTION}_{zone}"
+        self._attr_unique_id = f"pjm_{sensor_type}_{zone}"
         self._unit_of_measurement = "MW"
         self._state = None
 
-        # Configuration thresholds
         self._user_defined_threshold = peak_threshold
         self._accuracy_threshold = accuracy_threshold
 
-        # Keep recent load history (timestamp, load) and historical data
-        self._load_history = deque(maxlen=50)
+        self._load_history = deque(maxlen=300)
         self._historical_peaks = []
         self._historical_peak_accuracy = []
 
@@ -257,6 +261,10 @@ class CoincidentPeakPredictionSensor(SensorEntity):
     @property
     def native_value(self):
         return self._state
+
+    @property
+    def icon(self):
+        return "mdi:chart-timeline-variant"
 
     @property
     def extra_state_attributes(self):
@@ -301,7 +309,7 @@ class CoincidentPeakPredictionSensor(SensorEntity):
             loads.append(l)
 
         if len(times) < 3:
-            _LOGGER.debug("Not enough data for a proper quadratic fit. Patience, sexy!")
+            _LOGGER.debug("Not enough data for a proper quadratic fit. Patience!")
             self._state = load
             return
 
