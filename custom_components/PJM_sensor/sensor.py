@@ -117,7 +117,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 
     # Schedule staggered updates using async tasks
     for index, entity in enumerate(dev):
-        delay = 10 + (index * 10)
+        delay = 12 + (index * 12)
         hass.async_create_task(
             schedule_delayed_update(entity, delay)
         )
@@ -260,11 +260,11 @@ class PJMData:
         self._lock = asyncio.Lock()
 
     async def _rate_limit(self):
-        """Enforce ≤6 API calls per minute."""
+        """Enforce ≤5 API calls per minute."""
         async with self._lock:
             now = time_module.time()
             self._request_times = [t for t in self._request_times if now - t < 60]
-            while len(self._request_times) >= 6:
+            while len(self._request_times) >= 5:
                 oldest = self._request_times[0]
                 wait_time = 60 - (now - oldest) + 1
                 _LOGGER.debug("Rate limit reached. Waiting %.2f seconds.", wait_time)
