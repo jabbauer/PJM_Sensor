@@ -5,7 +5,7 @@ PJM Sensor Integration
 This module provides support for multiple PJM sensors—including the brand
 new Coincident Peak Prediction sensor that uses real-time load trends,
 derivative analysis, and quadratic regression to predict coincident peaks
-at the start of the hour. All API calls share the same rate-limited PJMData instance.
+at the start of the hour. All API calls now share your provided, tantalizing API key.
 
 Enjoy the passion—and the power—of smart energy monitoring!
 """
@@ -31,6 +31,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import (
     DOMAIN,
+    CONF_API_KEY,
     CONF_INSTANTANEOUS_ZONE_LOAD,
     CONF_INSTANTANEOUS_TOTAL_LOAD,
     CONF_ZONE_LOAD_FORECAST,
@@ -54,7 +55,8 @@ RESOURCE_INSTANTANEOUS = 'https://api.pjm.com/api/v1/inst_load'
 RESOURCE_FORECAST = 'https://api.pjm.com/api/v1/load_frcstd_7_day'
 RESOURCE_SHORT_FORECAST = 'https://api.pjm.com/api/v1/very_short_load_frcst'
 RESOURCE_LMP = 'https://api.pjm.com/api/v1/rt_unverified_fivemin_lmps'
-RESOURCE_SUBSCRIPTION_KEY = 'https://dataminer2.pjm.com/config/settings.json'
+# The subscription key resource is no longer needed since we use the provided API key.
+# RESOURCE_SUBSCRIPTION_KEY = 'https://dataminer2.pjm.com/config/settings.json'
 
 MIN_TIME_BETWEEN_UPDATES_INSTANTANEOUS = timedelta(seconds=300)  # 5 minutes for load, LMPs
 MIN_TIME_BETWEEN_UPDATES_FORECAST = timedelta(seconds=3600)  # 1 hour for forecasts
@@ -66,7 +68,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     """Set up the PJM sensor platform from a config entry."""
     zone = entry.data["zone"]
     selected_sensors = entry.data["sensors"]
-    pjm_data = PJMData(async_get_clientsession(hass))
+    # Pass the provided API key to PJMData!
+    pjm_data = PJMData(async_get_clientsession(hass), entry.data.get(CONF_API_KEY))
     dev = []
 
     for sensor_type in selected_sensors:
@@ -83,13 +86,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
                 continue
             dev.append(PJMSensor(pjm_data, sensor_type, pnode_id, None))
         elif sensor_type == CONF_COINCIDENT_PEAK_PREDICTION_ZONE:
-            # Use the configured zone (e.g., "COMED")
             peak_threshold = entry.data.get(CONF_PEAK_THRESHOLD, DEFAULT_PEAK_THRESHOLD)
             accuracy_threshold = entry.data.get(CONF_ACCURACY_THRESHOLD, DEFAULT_ACCURACY_THRESHOLD)
             dev.append(CoincidentPeakPredictionSensor(
                 pjm_data, zone, peak_threshold, accuracy_threshold, CONF_COINCIDENT_PEAK_PREDICTION_ZONE))
         elif sensor_type == CONF_COINCIDENT_PEAK_PREDICTION_SYSTEM:
-            # Use the system mapping ("PJM RTO")
             peak_threshold = entry.data.get(CONF_PEAK_THRESHOLD, DEFAULT_PEAK_THRESHOLD)
             accuracy_threshold = entry.data.get(CONF_ACCURACY_THRESHOLD, DEFAULT_ACCURACY_THRESHOLD)
             dev.append(CoincidentPeakPredictionSensor(
@@ -227,79 +228,82 @@ class PJMSensor(SensorEntity):
 class CoincidentPeakPredictionSensor(SensorEntity):
     """
     This sensor predicts PJM system coincident peaks at the start of the hour.
-    It uses real-time load data (via the shared PJMData instance), tracks the load history,
-    and performs quadratic regression to forecast the peak.
+    
+    It uses real-time load data (via the shared PJMData instance), tracks a rolling load history,
+    and performs quadratic regression to forecast the peak load and its arrival time.
+    
+    In addition, it now provides:
+      - A boolean attribute 'forecasted_peak_today' that is true all day if a valid forecast
+        predicts that the peak (above the effective threshold) will occur today.
+      - A boolean attribute 'peak_hour_active' that remains true for the entire hour when the predicted peak occurs.
+    
+    The historical peaks list (top 5) is reset on October 1st.
     """
     def __init__(self, pjm_data, zone, peak_threshold, accuracy_threshold, sensor_type):
         self._pjm_data = pjm_data
         self._zone = zone
-        self._sensor_type = sensor_type  # New parameter to indicate which type this is.
+        self._sensor_type = sensor_type  # Either CONF_COINCIDENT_PEAK_PREDICTION_ZONE or _SYSTEM
         self._attr_name = f"Coincident Peak Prediction ({zone})"
         self._attr_unique_id = f"pjm_{sensor_type}_{zone}"
         self._unit_of_measurement = "MW"
         self._state = None
 
+        # Configuration thresholds
         self._user_defined_threshold = peak_threshold
         self._accuracy_threshold = accuracy_threshold
 
+        # Increase the load history to 300 data points (approx. 25 hours)
         self._load_history = deque(maxlen=300)
         self._historical_peaks = []
         self._historical_peak_accuracy = []
 
-    @property
-    def name(self):
-        return self._attr_name
-
-    @property
-    def unique_id(self):
-        return self._attr_unique_id
-
-    @property
-    def unit_of_measurement(self):
-        return self._unit_of_measurement
-
-    @property
-    def native_value(self):
-        return self._state
-
-    @property
-    def icon(self):
-        return "mdi:chart-timeline-variant"
+        # New attributes for peak prediction
+        self._forecasted_peak_today = False
+        self._peak_hour_active = False
+        self._predicted_peak_time = None
 
     @property
     def extra_state_attributes(self):
         return {
             "predicted_peak": self._state,
-            "accuracy_probability_percent": round(self._compute_accuracy_probability() * 100, 1),
+            "predicted_peak_time": self._predicted_peak_time.isoformat() if self._predicted_peak_time else None,
+            "forecasted_peak_today": self._forecasted_peak_today,
+            "peak_hour_active": self._peak_hour_active,
+            "accuracy_probability_percent": round(self._compute_accuracy_probability() * 100, 1) if self._historical_peak_accuracy else "N/A",
             "load_history": [(ts.isoformat(), load) for ts, load in self._load_history],
             "historical_peaks": self._historical_peaks,
         }
 
-    @Throttle(MIN_TIME_BETWEEN_UPDATES_INSTANTANEOUS)
     async def async_update(self):
-        # 1. Fetch the current instantaneous load (yes, we’re using the same delicious API call!)
+        # 1. Retrieve current load
         load = await self._pjm_data.async_update_instantaneous(self._zone)
         if load is None:
-            _LOGGER.error("No load data received for peak prediction—oh, the nerve!")
+            _LOGGER.error("No load data received for peak prediction")
             return
 
-        now = datetime.now(timezone.utc)
-        self._load_history.append((now, load))
-        _LOGGER.debug("Peak predictor: added load %s MW at %s", load, now.isoformat())
+        now_utc = datetime.now(timezone.utc)
+        self._load_history.append((now_utc, load))
+        _LOGGER.debug("Peak predictor: added load %s MW at %s", load, now_utc.isoformat())
 
-        # Wait until we have enough data points
-        if len(self._load_history) < 5:
-            self._state = load
+        # Reset historical peaks on October 1st (local time)
+        now_local = datetime.now().astimezone()
+        if now_local.month == 10 and now_local.day == 1:
+            self._historical_peaks = []
+            _LOGGER.debug("Historical peaks reset on October 1st.")
+
+        # If insufficient data (e.g. fewer than 12 points), do not predict yet.
+        if len(self._load_history) < 12:
+            self._state = load  # just show current load
             return
 
-        # 2. Find the most recent local minimum (the moment the load started its sultry ascent)
+        # 2. Find the most recent local minimum ("turning point")
         local_min_index = self._find_local_minimum_index()
         if local_min_index is None:
-            _LOGGER.debug("No local minimum detected yet. More data, please, my dear!")
-            self._state = load
+            _LOGGER.debug("No local minimum detected in the current load history.")
+            self._state = load  # do not predict yet
             return
 
-        # 3. Build regression data from the local minimum to now
+        # 3. Build regression dataset from the local minimum to now
         times = []
         loads = []
         t0 = self._load_history[local_min_index][0]
@@ -307,77 +311,74 @@ class CoincidentPeakPredictionSensor(SensorEntity):
             delta_minutes = (t - t0).total_seconds() / 60.0
             times.append(delta_minutes)
             loads.append(l)
-
         if len(times) < 3:
-            _LOGGER.debug("Not enough data for a proper quadratic fit. Patience!")
+            _LOGGER.debug("Not enough data for quadratic regression.")
             self._state = load
             return
 
         try:
-            # Fit quadratic: load = A*t^2 + B*t + C
+            # Fit a quadratic: load = A*t^2 + B*t + C
             coeffs = np.polyfit(times, loads, 2)
             A, B, C = coeffs
-            _LOGGER.debug("Quadratic fit coefficients: A=%.4f, B=%.4f, C=%.4f", A, B, C)
+            _LOGGER.debug("Quadratic coefficients: A=%.4f, B=%.4f, C=%.4f", A, B, C)
         except Exception as e:
             _LOGGER.error("Quadratic regression failed: %s", e)
             self._state = load
             return
 
-        # 4. Check that the curve is concave down (A < 0) so a peak can exist
+        # 4. Ensure the curve is concave down (A < 0)
         if A >= 0:
-            _LOGGER.debug("Curve not concave down (A=%.4f). No peak forming, darling.", A)
+            _LOGGER.debug("Curve not concave down (A=%.4f). No peak forming.", A)
             self._state = load
             return
 
-        # 5. Calculate the time (in minutes from t0) when the derivative is zero (i.e. the peak)
+        # 5. Calculate predicted time (in minutes from t0) when the derivative is zero (i.e. the peak)
         t_peak = -B / (2 * A)
         if t_peak <= times[-1]:
-            _LOGGER.debug("Predicted peak time (%.2f minutes) already passed. Time to focus on the future!", t_peak)
+            _LOGGER.debug("Predicted peak time (%.2f minutes) already passed.", t_peak)
             self._state = load
             return
 
         predicted_peak_load = A * t_peak**2 + B * t_peak + C
-        _LOGGER.debug("Predicted peak load: %.2f MW arriving in %.2f minutes", predicted_peak_load, t_peak)
+        _LOGGER.debug("Predicted peak load: %.2f MW, calculated from t_peak=%.2f minutes", predicted_peak_load, t_peak)
 
-        # 6. Use the higher of the user-defined threshold or the 5th highest historical peak
-        threshold = max(self._user_defined_threshold, self._get_fifth_highest_peak())
-        _LOGGER.debug("Effective threshold used: %.2f MW", threshold)
-        if predicted_peak_load < threshold:
-            _LOGGER.debug("Predicted peak (%.2f MW) is below threshold. Not sizzling enough!", predicted_peak_load)
+        # 6. Determine the effective threshold (the higher of user threshold and the 5th historical peak)
+        effective_threshold = max(self._user_defined_threshold, self._get_fifth_highest_peak())
+        _LOGGER.debug("Effective threshold used: %.2f MW", effective_threshold)
+        if predicted_peak_load < effective_threshold:
+            _LOGGER.debug("Predicted peak (%.2f MW) is below the effective threshold.", predicted_peak_load)
             self._state = load
             return
 
-        # 7. Ensure our historical prediction accuracy is up to snuff
-        accuracy_prob = self._compute_accuracy_probability()
-        _LOGGER.debug("Prediction accuracy probability: %.2f%%", accuracy_prob * 100)
-        if accuracy_prob < self._accuracy_threshold:
-            _LOGGER.debug("Accuracy probability (%.2f%%) is below the threshold of %.2f%%. Need more practice, baby!", accuracy_prob * 100, self._accuracy_threshold * 100)
-            self._state = load
-            return
+        # 7. Compute the predicted peak datetime (using the t0 from the local minimum)
+        predicted_peak_time = t0 + timedelta(minutes=t_peak)
+        # Convert to local time for comparison
+        self._predicted_peak_time = predicted_peak_time.astimezone()
 
-        # 8. Check for load flattening (extended peak)
-        t_last, load_last = self._load_history[-1]
-        t_prev, load_prev = self._load_history[-2]
-        dt_minutes = (t_last - t_prev).total_seconds() / 60.0 or 1
-        derivative = (load_last - load_prev) / dt_minutes
-        _LOGGER.debug("Current derivative: %.2f MW/min", derivative)
+        # 8. Set the 'forecasted_peak_today' attribute:
+        if self._predicted_peak_time.date() == now_local.date():
+            self._forecasted_peak_today = True
+        else:
+            self._forecasted_peak_today = False
 
-        now_local = datetime.now()
+        # 9. Set the 'peak_hour_active' attribute:
+        predicted_peak_hour = self._predicted_peak_time.replace(minute=0, second=0, microsecond=0)
+        if predicted_peak_hour <= now_local < (predicted_peak_hour + timedelta(hours=1)):
+            self._peak_hour_active = True
+        else:
+            self._peak_hour_active = False
+
+        # 10. Update the sensor state:
         if now_local.minute < 5:
-            if load >= 0.95 * predicted_peak_load and abs(derivative) <= 10:
-                self._state = f"PEAK (extended): {round(predicted_peak_load)} MW"
-                _LOGGER.info("Extended peak flagged: %s", self._state)
-            else:
-                peak_time_est = (t0 + timedelta(minutes=t_peak)).strftime('%H:%M')
-                self._state = f"PEAK predicted: {round(predicted_peak_load)} MW at {peak_time_est}"
-                _LOGGER.info("Peak predicted: %s", self._state)
+            self._state = f"PEAK predicted: {round(predicted_peak_load)} MW at {self._predicted_peak_time.strftime('%H:%M')}"
+            _LOGGER.info("Peak predicted: %s", self._state)
         else:
             self._state = load
 
-        # 9. Update historical peaks
+        # 11. Update historical peaks if this load qualifies
         self._update_historical_peaks(load)
 
-        # 10. Update prediction accuracy at the hour’s start (simulate a hit if within 5,000 MW)
+        # 12. Update historical prediction accuracy (if within the first 5 minutes of the hour)
         if now_local.minute < 5:
             accuracy = 1 if abs(load - predicted_peak_load) < 5000 else 0
             self._historical_peak_accuracy.append(accuracy)
@@ -413,11 +414,10 @@ class CoincidentPeakPredictionSensor(SensorEntity):
 
 
 class PJMData:
-    """Get and parse data from PJM with coordinated API rate limiting."""
-
-    def __init__(self, websession):
+    """Get and parse data from PJM with coordinated API rate limiting using your API key."""
+    def __init__(self, websession, api_key):
         self._websession = websession
-        self._subscription_key = None
+        self._subscription_key = api_key  # Use the provided API key
         self._request_times = []
         self._lock = asyncio.Lock()
 
@@ -442,15 +442,10 @@ class PJMData:
         return headers
 
     async def _get_subscription_key(self):
+        # Since an API key is provided via configuration, we simply ensure it's set.
         if self._subscription_key:
             return
-        try:
-            with async_timeout.timeout(60):
-                response = await self._websession.get(RESOURCE_SUBSCRIPTION_KEY)
-                data = await response.json()
-                self._subscription_key = data['subscriptionKey']
-        except Exception as err:
-            _LOGGER.error("Failed to get subscription key: %s", err)
+        _LOGGER.error("API key not provided, cannot proceed with API calls.")
 
     async def async_update_instantaneous(self, zone):
         await self._rate_limit()
