@@ -5,9 +5,8 @@ PJM Sensor Integration
 This module provides support for multiple PJM sensors—including the brand
 new Coincident Peak Prediction sensor that uses real-time load trends,
 derivative analysis, and quadratic regression to predict coincident peaks
-at the start of the hour. All API calls now share your provided, tantalizing API key.
-
-Enjoy the passion—and the power—of smart energy monitoring!
+at the start of the hour. API calls will use your provided API key if available;
+otherwise, they'll fall back to fetching the subscription key.
 """
 
 import asyncio
@@ -51,12 +50,12 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Define resource URLs
 RESOURCE_INSTANTANEOUS = 'https://api.pjm.com/api/v1/inst_load'
 RESOURCE_FORECAST = 'https://api.pjm.com/api/v1/load_frcstd_7_day'
 RESOURCE_SHORT_FORECAST = 'https://api.pjm.com/api/v1/very_short_load_frcst'
 RESOURCE_LMP = 'https://api.pjm.com/api/v1/rt_unverified_fivemin_lmps'
-# The subscription key resource is no longer needed since we use the provided API key.
-# RESOURCE_SUBSCRIPTION_KEY = 'https://dataminer2.pjm.com/config/settings.json'
+RESOURCE_SUBSCRIPTION_KEY = 'https://dataminer2.pjm.com/config/settings.json'
 
 MIN_TIME_BETWEEN_UPDATES_INSTANTANEOUS = timedelta(seconds=300)  # 5 minutes for load, LMPs
 MIN_TIME_BETWEEN_UPDATES_FORECAST = timedelta(seconds=3600)  # 1 hour for forecasts
@@ -352,21 +351,14 @@ class CoincidentPeakPredictionSensor(SensorEntity):
 
         # 7. Compute the predicted peak datetime (using the t0 from the local minimum)
         predicted_peak_time = t0 + timedelta(minutes=t_peak)
-        # Convert to local time for comparison
         self._predicted_peak_time = predicted_peak_time.astimezone()
 
         # 8. Set the 'forecasted_peak_today' attribute:
-        if self._predicted_peak_time.date() == now_local.date():
-            self._forecasted_peak_today = True
-        else:
-            self._forecasted_peak_today = False
+        self._forecasted_peak_today = (self._predicted_peak_time.date() == now_local.date())
 
         # 9. Set the 'peak_hour_active' attribute:
         predicted_peak_hour = self._predicted_peak_time.replace(minute=0, second=0, microsecond=0)
-        if predicted_peak_hour <= now_local < (predicted_peak_hour + timedelta(hours=1)):
-            self._peak_hour_active = True
-        else:
-            self._peak_hour_active = False
+        self._peak_hour_active = (predicted_peak_hour <= now_local < (predicted_peak_hour + timedelta(hours=1)))
 
         # 10. Update the sensor state:
         if now_local.minute < 5:
@@ -414,10 +406,10 @@ class CoincidentPeakPredictionSensor(SensorEntity):
 
 
 class PJMData:
-    """Get and parse data from PJM with coordinated API rate limiting using your API key."""
+    """Get and parse data from PJM with coordinated API rate limiting using your API key or fetched subscription key."""
     def __init__(self, websession, api_key):
         self._websession = websession
-        self._subscription_key = api_key  # Use the provided API key
+        self._subscription_key = api_key  # Use provided API key; if not provided, we'll fetch one.
         self._request_times = []
         self._lock = asyncio.Lock()
 
@@ -442,10 +434,18 @@ class PJMData:
         return headers
 
     async def _get_subscription_key(self):
-        # Since an API key is provided via configuration, we simply ensure it's set.
+        """Fetch the subscription key if no API key was provided."""
         if self._subscription_key:
             return
-        _LOGGER.error("API key not provided, cannot proceed with API calls.")
+        try:
+            with async_timeout.timeout(60):
+                response = await self._websession.get(RESOURCE_SUBSCRIPTION_KEY)
+                data = await response.json()
+                self._subscription_key = data.get('subscriptionKey')
+                if not self._subscription_key:
+                    _LOGGER.error("No subscription key found in response from %s", RESOURCE_SUBSCRIPTION_KEY)
+        except Exception as err:
+            _LOGGER.error("Failed to get subscription key: %s", err)
 
     async def async_update_instantaneous(self, zone):
         await self._rate_limit()
