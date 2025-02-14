@@ -14,7 +14,8 @@ CONF_ZONE_SHORT_FORECAST = 'zone_short_forecast'
 CONF_TOTAL_SHORT_FORECAST = 'total_short_forecast'
 CONF_ZONAL_LMP = 'zonal_lmp'
 # NEW: Coincident Peak Prediction Sensor
-CONF_COINCIDENT_PEAK_PREDICTION = "coincident_peak_prediction"
+CONF_COINCIDENT_PEAK_PREDICTION_ZONE = "coincident_peak_prediction_zone"
+CONF_COINCIDENT_PEAK_PREDICTION_SYSTEM = "coincident_peak_prediction_system"
 
 # New configuration options for the peak predictor
 CONF_PEAK_THRESHOLD = "peak_threshold"
