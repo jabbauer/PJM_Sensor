@@ -25,11 +25,8 @@ SENSOR_OPTIONS = {
     "coincident_peak_prediction_system": "Coincident Peak Prediction (System)",
 }
 
-SYSTEM_SENSORS = {
-    "instantaneous_total_load",
-    "total_short_forecast",
-    "total_load_forecast",
-}
+# Default sensors: Only the first 3 are enabled by default
+DEFAULT_SENSORS = {"instantaneous_total_load", "total_short_forecast", "total_load_forecast"}
 
 class PJMConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for PJM integration."""
@@ -43,10 +40,11 @@ class PJMConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             selected_sensors = [
-                sensor_id 
-                for sensor_id in SENSOR_OPTIONS 
+                sensor_id
+                for sensor_id in SENSOR_OPTIONS
                 if user_input.get(sensor_id, False)
             ]
+            # If no sensors are selected, show an error.
             if not selected_sensors:
                 errors["base"] = "no_sensors_selected"
                 return self.async_show_form(
@@ -54,9 +52,18 @@ class PJMConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     data_schema=self._build_schema(user_input),
                     errors=errors
                 )
+            # If no API key is provided, limit the sensors to a maximum of 3.
+            if not user_input.get("api_key") and len(selected_sensors) > 3:
+                errors["base"] = "max_sensors_exceeded_without_api_key"
+                return self.async_show_form(
+                    step_id="user",
+                    data_schema=self._build_schema(user_input),
+                    errors=errors
+                )
+
             self.entry_data = {
                 "zone": user_input["zone"],
-                "api_key": user_input["api_key"],
+                "api_key": user_input.get("api_key"),  # Now optional!
                 "sensors": selected_sensors,
                 "peak_threshold": user_input.get("peak_threshold", DEFAULT_PEAK_THRESHOLD),
                 "accuracy_threshold": user_input.get("accuracy_threshold", DEFAULT_ACCURACY_THRESHOLD),
@@ -70,20 +77,22 @@ class PJMConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     def _build_schema(self, defaults=None):
+        """Build the configuration schema with our custom defaults."""
         defaults = defaults or {
             "zone": "PJM-RTO",
-            "api_key": "",
+            "api_key": "",  # API key is now optional
             "peak_threshold": DEFAULT_PEAK_THRESHOLD,
             "accuracy_threshold": DEFAULT_ACCURACY_THRESHOLD
         }
         schema_dict = {
             vol.Required("zone", default=defaults.get("zone")): vol.In(self.zone_list),
-            vol.Required("api_key", default=defaults.get("api_key")): str,
+            vol.Optional("api_key", default=defaults.get("api_key")): str,  # No longer required!
             vol.Optional("peak_threshold", default=defaults.get("peak_threshold")): cv.positive_int,
             vol.Optional("accuracy_threshold", default=defaults.get("accuracy_threshold")): vol.Coerce(float),
         }
+        # Default only the first three sensors as selected
         for sensor_id, sensor_label in SENSOR_OPTIONS.items():
-            default_value = defaults.get(sensor_id, sensor_id in SYSTEM_SENSORS or sensor_id.startswith("coincident_peak_prediction"))
+            default_value = sensor_id in DEFAULT_SENSORS
             schema_dict[vol.Optional(sensor_id, default=default_value)] = bool
         return vol.Schema(schema_dict)
 
@@ -108,10 +117,18 @@ class PJMOptionsFlowHandler(config_entries.OptionsFlow):
 
         if user_input is not None:
             selected_sensors = [
-                sensor_id 
-                for sensor_id in SENSOR_OPTIONS 
+                sensor_id
+                for sensor_id in SENSOR_OPTIONS
                 if user_input.get(sensor_id, False)
             ]
+            # Enforce the sensor limit if no API key is provided.
+            if not user_input.get("api_key") and len(selected_sensors) > 3:
+                errors["base"] = "max_sensors_exceeded_without_api_key"
+                return self.async_show_form(
+                    step_id="init",
+                    data_schema=self._build_schema(user_input),
+                    errors=errors
+                )
             if not selected_sensors:
                 errors["base"] = "no_sensors_selected"
                 return self.async_show_form(
@@ -122,7 +139,7 @@ class PJMOptionsFlowHandler(config_entries.OptionsFlow):
             updated_data = {**self._config_entry.data}
             updated_data.update({
                 "zone": user_input["zone"],
-                "api_key": user_input["api_key"],
+                "api_key": user_input.get("api_key"),  # API key remains optional
                 "sensors": selected_sensors,
                 "peak_threshold": user_input.get("peak_threshold", DEFAULT_PEAK_THRESHOLD),
                 "accuracy_threshold": user_input.get("accuracy_threshold", DEFAULT_ACCURACY_THRESHOLD),
@@ -145,12 +162,15 @@ class PJMOptionsFlowHandler(config_entries.OptionsFlow):
         )
 
     def _build_schema(self, data):
+        """Build the options flow schema with our custom defaults."""
         schema_dict = {
             vol.Required("zone", default=data.get("zone")): vol.In(sorted(ZONE_TO_PNODE_ID.keys())),
-            vol.Required("api_key", default=data.get("api_key")): str,
+            vol.Optional("api_key", default=data.get("api_key")): str,  # API key stays optional
             vol.Optional("peak_threshold", default=data.get("peak_threshold", DEFAULT_PEAK_THRESHOLD)): cv.positive_int,
             vol.Optional("accuracy_threshold", default=data.get("accuracy_threshold", DEFAULT_ACCURACY_THRESHOLD)): vol.Coerce(float),
         }
+        # Default only the first three sensors as selected
         for sensor_id, sensor_label in SENSOR_OPTIONS.items():
-            schema_dict[vol.Optional(sensor_id, default=data.get(sensor_id, sensor_id in SYSTEM_SENSORS or sensor_id.startswith("coincident_peak_prediction")))] = bool
+            default_value = sensor_id in DEFAULT_SENSORS
+            schema_dict[vol.Optional(sensor_id, default=default_value)] = bool
         return vol.Schema(schema_dict)
