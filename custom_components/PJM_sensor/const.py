@@ -68,5 +68,6 @@ SENSOR_TYPES = {
     CONF_ZONE_SHORT_FORECAST: ["Zone 2HR Forecast", "MW"],
     CONF_TOTAL_SHORT_FORECAST: ["PJM 2HR Forecast", "MW"],
     CONF_ZONAL_LMP: ["Hourly Average Zonal LMP", '$/MWh'],
-    CONF_COINCIDENT_PEAK_PREDICTION: ["Coincident Peak Prediction", "MW"],
+    CONF_COINCIDENT_PEAK_PREDICTION_ZONE: ["Coincident Peak Prediction (Zone)", "MW"],
+    CONF_COINCIDENT_PEAK_PREDICTION_SYSTEM: ["Coincident Peak Prediction (System)", "MW"],
 }
