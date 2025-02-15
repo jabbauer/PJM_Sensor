@@ -85,15 +85,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
                 continue
             dev.append(PJMSensor(pjm_data, sensor_type, pnode_id, None))
         elif sensor_type == CONF_COINCIDENT_PEAK_PREDICTION_ZONE:
-            peak_threshold = entry.data.get(CONF_PEAK_THRESHOLD, DEFAULT_PEAK_THRESHOLD)
+            # Use the configured zone-specific peak threshold
+            peak_threshold = entry.data.get("peak_threshold_zone", DEFAULT_PEAK_THRESHOLD_ZONE)
             accuracy_threshold = entry.data.get(CONF_ACCURACY_THRESHOLD, DEFAULT_ACCURACY_THRESHOLD)
             dev.append(CoincidentPeakPredictionSensor(
                 pjm_data, zone, peak_threshold, accuracy_threshold, CONF_COINCIDENT_PEAK_PREDICTION_ZONE))
         elif sensor_type == CONF_COINCIDENT_PEAK_PREDICTION_SYSTEM:
-            peak_threshold = entry.data.get(CONF_PEAK_THRESHOLD, DEFAULT_PEAK_THRESHOLD)
+            # Use the system-specific threshold (for PJM_RTO_ZONE)
+            peak_threshold = entry.data.get("peak_threshold_system", DEFAULT_PEAK_THRESHOLD_SYSTEM)
             accuracy_threshold = entry.data.get(CONF_ACCURACY_THRESHOLD, DEFAULT_ACCURACY_THRESHOLD)
             dev.append(CoincidentPeakPredictionSensor(
-                pjm_data, PJM_RTO_ZONE, peak_threshold, accuracy_threshold, CONF_COINCIDENT_PEAK_PREDICTION_SYSTEM))
+            pjm_data, PJM_RTO_ZONE, peak_threshold, accuracy_threshold, CONF_COINCIDENT_PEAK_PREDICTION_SYSTEM))
         else:
             dev.append(PJMSensor(pjm_data, sensor_type, identifier, None))
 
