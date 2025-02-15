@@ -8,9 +8,10 @@ import homeassistant.helpers.config_validation as cv
 from .const import (
     DOMAIN,
     ZONE_TO_PNODE_ID,
-    DEFAULT_PEAK_THRESHOLD,
     DEFAULT_ACCURACY_THRESHOLD,
     CONF_API_KEY,
+    CONF_COINCIDENT_PEAK_PREDICTION_ZONE,
+    CONF_COINCIDENT_PEAK_PREDICTION_SYSTEM,
 )
 
 SENSOR_OPTIONS = {
@@ -21,12 +22,16 @@ SENSOR_OPTIONS = {
     "zone_short_forecast": "Zonal 2Hr Forecast",
     "zone_load_forecast": "Zonal Daily Forecast",
     "zonal_lmp": "Zonal LMP",
-    "coincident_peak_prediction_zone": "Coincident Peak Prediction (Zone)",
-    "coincident_peak_prediction_system": "Coincident Peak Prediction (System)",
+    CONF_COINCIDENT_PEAK_PREDICTION_ZONE: "Coincident Peak Prediction (Zone)",
+    CONF_COINCIDENT_PEAK_PREDICTION_SYSTEM: "Coincident Peak Prediction (System)",
 }
 
-# Default sensors: Only the first 3 are enabled by default
+# Default sensors: Only the first 3 are enabled by default.
 DEFAULT_SENSORS = {"instantaneous_total_load", "total_short_forecast", "total_load_forecast"}
+
+# New default thresholds for coincident peak predictions.
+DEFAULT_PEAK_THRESHOLD_ZONE = 16500
+DEFAULT_PEAK_THRESHOLD_SYSTEM = 140000
 
 class PJMConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for PJM integration."""
@@ -40,32 +45,30 @@ class PJMConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             selected_sensors = [
-                sensor_id
-                for sensor_id in SENSOR_OPTIONS
-                if user_input.get(sensor_id, False)
+                sensor_id for sensor_id in SENSOR_OPTIONS if user_input.get(sensor_id, False)
             ]
-            # If no sensors are selected, show an error.
             if not selected_sensors:
                 errors["base"] = "no_sensors_selected"
                 return self.async_show_form(
                     step_id="user",
                     data_schema=self._build_schema(user_input),
-                    errors=errors
+                    errors=errors,
                 )
-            # If no API key is provided, limit the sensors to a maximum of 3.
+            # Without an API key, limit to a maximum of 3 sensors.
             if not user_input.get("api_key") and len(selected_sensors) > 3:
                 errors["base"] = "max_sensors_exceeded_without_api_key"
                 return self.async_show_form(
                     step_id="user",
                     data_schema=self._build_schema(user_input),
-                    errors=errors
+                    errors=errors,
                 )
 
             self.entry_data = {
                 "zone": user_input["zone"],
-                "api_key": user_input.get("api_key"),  # Now optional!
+                "api_key": user_input.get("api_key"),
                 "sensors": selected_sensors,
-                "peak_threshold": user_input.get("peak_threshold", DEFAULT_PEAK_THRESHOLD),
+                "peak_threshold_zone": user_input.get("peak_threshold_zone", DEFAULT_PEAK_THRESHOLD_ZONE),
+                "peak_threshold_system": user_input.get("peak_threshold_system", DEFAULT_PEAK_THRESHOLD_SYSTEM),
                 "accuracy_threshold": user_input.get("accuracy_threshold", DEFAULT_ACCURACY_THRESHOLD),
             }
             return self.async_create_entry(title="PJM Integration", data=self.entry_data)
@@ -73,27 +76,34 @@ class PJMConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="user",
             data_schema=self._build_schema(),
-            errors=errors
+            errors=errors,
         )
 
     def _build_schema(self, defaults=None):
-        """Build the configuration schema with our custom defaults."""
+        """Build the configuration schema.
+        
+        Order: zone, api_key, sensor checkboxes, then peak threshold fields, then accuracy_threshold.
+        """
         defaults = defaults or {
             "zone": "PJM-RTO",
-            "api_key": "",  # API key is now optional
-            "peak_threshold": DEFAULT_PEAK_THRESHOLD,
-            "accuracy_threshold": DEFAULT_ACCURACY_THRESHOLD
+            "api_key": "",
+            "peak_threshold_zone": DEFAULT_PEAK_THRESHOLD_ZONE,
+            "peak_threshold_system": DEFAULT_PEAK_THRESHOLD_SYSTEM,
+            "accuracy_threshold": DEFAULT_ACCURACY_THRESHOLD,
         }
-        schema_dict = {
-            vol.Required("zone", default=defaults.get("zone")): vol.In(self.zone_list),
-            vol.Optional("api_key", default=defaults.get("api_key")): str,  # No longer required!
-            vol.Optional("peak_threshold", default=defaults.get("peak_threshold")): cv.positive_int,
-            vol.Optional("accuracy_threshold", default=defaults.get("accuracy_threshold")): vol.Coerce(float),
-        }
-        # Default only the first three sensors as selected
+        schema_dict = {}
+        # General settings.
+        schema_dict[vol.Required("zone", default=defaults.get("zone"))] = vol.In(self.zone_list)
+        schema_dict[vol.Optional("api_key", default=defaults.get("api_key"))] = str
+        # Sensor selection checkboxes.
         for sensor_id, sensor_label in SENSOR_OPTIONS.items():
             default_value = sensor_id in DEFAULT_SENSORS
             schema_dict[vol.Optional(sensor_id, default=default_value)] = bool
+        # Peak threshold fields (added after sensor checkboxes).
+        schema_dict[vol.Optional("peak_threshold_zone", default=defaults.get("peak_threshold_zone"))] = cv.positive_int
+        schema_dict[vol.Optional("peak_threshold_system", default=defaults.get("peak_threshold_system"))] = cv.positive_int
+        # Accuracy threshold.
+        schema_dict[vol.Optional("accuracy_threshold", default=defaults.get("accuracy_threshold"))] = vol.Coerce(float)
         return vol.Schema(schema_dict)
 
     @staticmethod
@@ -109,68 +119,60 @@ class PJMOptionsFlowHandler(config_entries.OptionsFlow):
 
     async def async_step_init(self, user_input=None):
         errors = {}
-        current_sensors = self._config_entry.data.get("sensors", [])
-        current_zone = self._config_entry.data.get("zone", "PJM-RTO")
-        current_api_key = self._config_entry.data.get("api_key", "")
-        current_peak_threshold = self._config_entry.data.get("peak_threshold", DEFAULT_PEAK_THRESHOLD)
-        current_accuracy_threshold = self._config_entry.data.get("accuracy_threshold", DEFAULT_ACCURACY_THRESHOLD)
-
+        current_data = self._config_entry.data
         if user_input is not None:
             selected_sensors = [
-                sensor_id
-                for sensor_id in SENSOR_OPTIONS
-                if user_input.get(sensor_id, False)
+                sensor_id for sensor_id in SENSOR_OPTIONS if user_input.get(sensor_id, False)
             ]
-            # Enforce the sensor limit if no API key is provided.
             if not user_input.get("api_key") and len(selected_sensors) > 3:
                 errors["base"] = "max_sensors_exceeded_without_api_key"
                 return self.async_show_form(
                     step_id="init",
                     data_schema=self._build_schema(user_input),
-                    errors=errors
+                    errors=errors,
                 )
             if not selected_sensors:
                 errors["base"] = "no_sensors_selected"
                 return self.async_show_form(
                     step_id="init",
                     data_schema=self._build_schema(user_input),
-                    errors=errors
+                    errors=errors,
                 )
-            updated_data = {**self._config_entry.data}
+            updated_data = {**current_data}
             updated_data.update({
                 "zone": user_input["zone"],
-                "api_key": user_input.get("api_key"),  # API key remains optional
+                "api_key": user_input.get("api_key"),
                 "sensors": selected_sensors,
-                "peak_threshold": user_input.get("peak_threshold", DEFAULT_PEAK_THRESHOLD),
-                "accuracy_threshold": user_input.get("accuracy_threshold", DEFAULT_ACCURACY_THRESHOLD),
+                "peak_threshold_zone": user_input.get("peak_threshold_zone", DEFAULT_PEAK_THRESHOLD_ZONE),
+                "peak_threshold_system": user_input.get("peak_threshold_system", DEFAULT_PEAK_THRESHOLD_SYSTEM),
+                "accuracy_threshold": user_input.get("accuracy_threshold", current_data.get("accuracy_threshold", DEFAULT_ACCURACY_THRESHOLD)),
             })
-            self.hass.config_entries.async_update_entry(
-                self._config_entry,
-                data=updated_data
-            )
+            self.hass.config_entries.async_update_entry(self._config_entry, data=updated_data)
             return self.async_create_entry(title="", data={})
-
         return self.async_show_form(
             step_id="init",
             data_schema=self._build_schema({
-                "zone": current_zone,
-                "api_key": current_api_key,
-                "peak_threshold": current_peak_threshold,
-                "accuracy_threshold": current_accuracy_threshold,
+                "zone": current_data.get("zone", "PJM-RTO"),
+                "api_key": current_data.get("api_key", ""),
+                "peak_threshold_zone": current_data.get("peak_threshold_zone", DEFAULT_PEAK_THRESHOLD_ZONE),
+                "peak_threshold_system": current_data.get("peak_threshold_system", DEFAULT_PEAK_THRESHOLD_SYSTEM),
+                "accuracy_threshold": current_data.get("accuracy_threshold", DEFAULT_ACCURACY_THRESHOLD),
             }),
-            errors=errors
+            errors=errors,
         )
 
     def _build_schema(self, data):
-        """Build the options flow schema with our custom defaults."""
-        schema_dict = {
-            vol.Required("zone", default=data.get("zone")): vol.In(sorted(ZONE_TO_PNODE_ID.keys())),
-            vol.Optional("api_key", default=data.get("api_key")): str,  # API key stays optional
-            vol.Optional("peak_threshold", default=data.get("peak_threshold", DEFAULT_PEAK_THRESHOLD)): cv.positive_int,
-            vol.Optional("accuracy_threshold", default=data.get("accuracy_threshold", DEFAULT_ACCURACY_THRESHOLD)): vol.Coerce(float),
-        }
-        # Default only the first three sensors as selected
+        schema_dict = {}
+        # General settings.
+        schema_dict[vol.Required("zone", default=data.get("zone"))] = vol.In(sorted(ZONE_TO_PNODE_ID.keys()))
+        schema_dict[vol.Optional("api_key", default=data.get("api_key"))] = str
+        # Sensor selection checkboxes.
         for sensor_id, sensor_label in SENSOR_OPTIONS.items():
             default_value = sensor_id in DEFAULT_SENSORS
             schema_dict[vol.Optional(sensor_id, default=default_value)] = bool
+        # Peak threshold fields.
+        schema_dict[vol.Optional("peak_threshold_zone", default=data.get("peak_threshold_zone", DEFAULT_PEAK_THRESHOLD_ZONE))] = cv.positive_int
+        schema_dict[vol.Optional("peak_threshold_system", default=data.get("peak_threshold_system", DEFAULT_PEAK_THRESHOLD_SYSTEM))] = cv.positive_int
+        # Accuracy threshold.
+        schema_dict[vol.Optional("accuracy_threshold", default=data.get("accuracy_threshold", DEFAULT_ACCURACY_THRESHOLD))] = vol.Coerce(float)
         return vol.Schema(schema_dict)
