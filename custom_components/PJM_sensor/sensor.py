@@ -42,6 +42,8 @@ from .const import (
     CONF_COINCIDENT_PEAK_PREDICTION_SYSTEM,
     CONF_PEAK_THRESHOLD,
     CONF_ACCURACY_THRESHOLD,
+    DEFAULT_PEAK_THRESHOLD_ZONE,
+    DEFAULT_PEAK_THRESHOLD_SYSTEM,
     DEFAULT_ACCURACY_THRESHOLD,
     ZONE_TO_PNODE_ID,
     SENSOR_TYPES,
@@ -234,8 +236,10 @@ class CoincidentPeakPredictionSensor(SensorEntity):
     
     In addition, it now provides:
       - A boolean attribute 'forecasted_peak_today' that is true all day if a valid forecast
-        predicts that the peak (above the effective threshold) will occur today.
-      - A boolean attribute 'peak_hour_active' that remains true for the entire hour when the predicted peak occurs.
+        (i.e. a predicted peak load meeting or exceeding the effective threshold) indicates that the peak
+        will occur today.
+      - A boolean attribute 'peak_hour_active' that is true for the entire hour when the predicted peak occurs,
+        again only if the predicted peak meets or exceeds the effective threshold.
     
     The historical peaks list (top 5) is reset on October 1st.
     """
@@ -269,7 +273,8 @@ class CoincidentPeakPredictionSensor(SensorEntity):
             "predicted_peak_time": self._predicted_peak_time.isoformat() if self._predicted_peak_time else None,
             "forecasted_peak_today": self._forecasted_peak_today,
             "peak_hour_active": self._peak_hour_active,
-            "accuracy_probability_percent": round(self._compute_accuracy_probability() * 100, 1) if self._historical_peak_accuracy else "N/A",
+            "accuracy_probability_percent": round(self._compute_accuracy_probability() * 100, 1)
+                if self._historical_peak_accuracy else "N/A",
             "load_history": [(ts.isoformat(), load) for ts, load in self._load_history],
             "historical_peaks": self._historical_peaks,
         }
@@ -293,14 +298,20 @@ class CoincidentPeakPredictionSensor(SensorEntity):
 
         # If insufficient data (e.g. fewer than 12 points), do not predict yet.
         if len(self._load_history) < 12:
-            self._state = load  # just show current load
+            # Not enough data to perform a quadratic regression yet;
+            # keep showing the current load.
+            self._state = load
+            self._forecasted_peak_today = False
+            self._peak_hour_active = False
             return
 
         # 2. Find the most recent local minimum ("turning point")
         local_min_index = self._find_local_minimum_index()
         if local_min_index is None:
             _LOGGER.debug("No local minimum detected in the current load history.")
-            self._state = load  # do not predict yet
+            self._state = load  # still insufficient info to forecast peak accurately
+            self._forecasted_peak_today = False
+            self._peak_hour_active = False
             return
 
         # 3. Build regression dataset from the local minimum to now
@@ -314,6 +325,8 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         if len(times) < 3:
             _LOGGER.debug("Not enough data for quadratic regression.")
             self._state = load
+            self._forecasted_peak_today = False
+            self._peak_hour_active = False
             return
 
         try:
@@ -324,12 +337,16 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         except Exception as e:
             _LOGGER.error("Quadratic regression failed: %s", e)
             self._state = load
+            self._forecasted_peak_today = False
+            self._peak_hour_active = False
             return
 
         # 4. Ensure the curve is concave down (A < 0)
         if A >= 0:
             _LOGGER.debug("Curve not concave down (A=%.4f). No peak forming.", A)
             self._state = load
+            self._forecasted_peak_today = False
+            self._peak_hour_active = False
             return
 
         # 5. Calculate predicted time (in minutes from t0) when the derivative is zero (i.e. the peak)
@@ -337,38 +354,41 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         if t_peak <= times[-1]:
             _LOGGER.debug("Predicted peak time (%.2f minutes) already passed.", t_peak)
             self._state = load
+            self._forecasted_peak_today = False
+            self._peak_hour_active = False
             return
 
         predicted_peak_load = A * t_peak**2 + B * t_peak + C
         _LOGGER.debug("Predicted peak load: %.2f MW, calculated from t_peak=%.2f minutes", predicted_peak_load, t_peak)
 
-        # 6. Determine the effective threshold (the higher of user threshold and the 5th historical peak)
+        # 6. Compute the effective threshold for additional attributes.
         effective_threshold = max(self._user_defined_threshold, self._get_fifth_highest_peak())
         _LOGGER.debug("Effective threshold used: %.2f MW", effective_threshold)
-        if predicted_peak_load < effective_threshold:
-            _LOGGER.debug("Predicted peak (%.2f MW) is below the effective threshold.", predicted_peak_load)
-            self._state = load
-            return
 
-        # 7. Compute the predicted peak datetime (using the t0 from the local minimum)
+        # 7. Compute the predicted peak datetime (using t0 from the local minimum)
         predicted_peak_time = t0 + timedelta(minutes=t_peak)
         self._predicted_peak_time = predicted_peak_time.astimezone()
 
-        # 8. Set the 'forecasted_peak_today' attribute:
-        self._forecasted_peak_today = (self._predicted_peak_time.date() == now_local.date())
+        # 8. Always return the predicted peak load as the sensor state.
+        self._state = round(predicted_peak_load)
 
-        # 9. Set the 'peak_hour_active' attribute:
-        predicted_peak_hour = self._predicted_peak_time.replace(minute=0, second=0, microsecond=0)
-        self._peak_hour_active = (predicted_peak_hour <= now_local < (predicted_peak_hour + timedelta(hours=1)))
-
-        # 10. Update the sensor state:
-        if now_local.minute < 5:
-            self._state = f"PEAK predicted: {round(predicted_peak_load)} MW at {self._predicted_peak_time.strftime('%H:%M')}"
-            _LOGGER.info("Peak predicted: %s", self._state)
+        # 9. Set the 'forecasted_peak_today' attribute based on threshold and timing.
+        #    Only if the predicted peak load meets/exceeds the effective threshold.
+        if predicted_peak_load >= effective_threshold and (self._predicted_peak_time.date() == now_local.date()):
+            self._forecasted_peak_today = True
         else:
-            self._state = load
+            self._forecasted_peak_today = False
 
-        # 11. Update historical peaks if this load qualifies
+        # 10. Set the 'peak_hour_active' attribute.
+        #    It will be True only during the full hour when the predicted peak is expected,
+        #    and only if the predicted peak load meets/exceeds the effective threshold.
+        predicted_peak_hour = self._predicted_peak_time.replace(minute=0, second=0, microsecond=0)
+        if predicted_peak_load >= effective_threshold and (predicted_peak_hour <= now_local < (predicted_peak_hour + timedelta(hours=1))):
+            self._peak_hour_active = True
+        else:
+            self._peak_hour_active = False
+
+        # 11. Update historical peaks if this load qualifies.
         self._update_historical_peaks(load)
 
         # 12. Update historical prediction accuracy (if within the first 5 minutes of the hour)
