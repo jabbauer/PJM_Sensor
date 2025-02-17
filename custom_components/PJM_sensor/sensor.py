@@ -4,9 +4,9 @@ PJM Sensor Integration
 
 This module provides support for multiple PJM sensors—including the brand
 new Coincident Peak Prediction sensor that uses real-time load trends,
-derivative analysis, and quadratic regression to predict coincident peaks
-at the start of the hour. API calls will use your provided API key if available;
-otherwise, they'll fall back to fetching the subscription key.
+derivative analysis, and piecewise quadratic regression to predict coincident
+peaks at the start of the hour. API calls will use your provided API key if
+available; otherwise, they'll fall back to fetching the subscription key.
 """
 
 import asyncio
@@ -19,6 +19,7 @@ import time as time_module
 import async_timeout
 import aiohttp
 import numpy as np
+from scipy.optimize import curve_fit
 
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
@@ -63,12 +64,16 @@ MIN_TIME_BETWEEN_UPDATES_FORECAST = timedelta(seconds=3600)  # 1 hour for foreca
 
 PJM_RTO_ZONE = "PJM RTO"
 FORECAST_COMBINED_ZONE = 'RTO_COMBINED'
+MAX_HISTORY_SIZE = 300  # about 25 hours of data at 5-min intervals
+
+# Standard quadratic function
+def _quadratic(x, a, b, c):
+    return a * x**2 + b * x + c
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback):
     """Set up the PJM sensor platform from a config entry."""
     zone = entry.data["zone"]
     selected_sensors = entry.data["sensors"]
-    # Pass the provided API key to PJMData!
     pjm_data = PJMData(async_get_clientsession(hass), entry.data.get(CONF_API_KEY))
     dev = []
 
@@ -85,24 +90,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
                 _LOGGER.error("Invalid zone provided for LMP: %s", zone)
                 continue
             dev.append(PJMSensor(pjm_data, sensor_type, pnode_id, None))
-        elif sensor_type == CONF_COINCIDENT_PEAK_PREDICTION_ZONE:
-            # Use the configured zone-specific peak threshold
-            peak_threshold = entry.data.get("peak_threshold_zone", DEFAULT_PEAK_THRESHOLD_ZONE)
+        elif sensor_type in (CONF_COINCIDENT_PEAK_PREDICTION_ZONE, CONF_COINCIDENT_PEAK_PREDICTION_SYSTEM):
+            if sensor_type == CONF_COINCIDENT_PEAK_PREDICTION_ZONE:
+                peak_threshold = entry.data.get("peak_threshold_zone", DEFAULT_PEAK_THRESHOLD_ZONE)
+            else:
+                peak_threshold = entry.data.get("peak_threshold_system", DEFAULT_PEAK_THRESHOLD_SYSTEM)
             accuracy_threshold = entry.data.get(CONF_ACCURACY_THRESHOLD, DEFAULT_ACCURACY_THRESHOLD)
             dev.append(CoincidentPeakPredictionSensor(
-                pjm_data, zone, peak_threshold, accuracy_threshold, CONF_COINCIDENT_PEAK_PREDICTION_ZONE))
-        elif sensor_type == CONF_COINCIDENT_PEAK_PREDICTION_SYSTEM:
-            # Use the system-specific threshold (for PJM_RTO_ZONE)
-            peak_threshold = entry.data.get("peak_threshold_system", DEFAULT_PEAK_THRESHOLD_SYSTEM)
-            accuracy_threshold = entry.data.get(CONF_ACCURACY_THRESHOLD, DEFAULT_ACCURACY_THRESHOLD)
-            dev.append(CoincidentPeakPredictionSensor(
-            pjm_data, PJM_RTO_ZONE, peak_threshold, accuracy_threshold, CONF_COINCIDENT_PEAK_PREDICTION_SYSTEM))
+                pjm_data, zone if sensor_type == CONF_COINCIDENT_PEAK_PREDICTION_ZONE else PJM_RTO_ZONE,
+                peak_threshold, accuracy_threshold, sensor_type))
         else:
             dev.append(PJMSensor(pjm_data, sensor_type, identifier, None))
 
     async_add_entities(dev, True)
 
-    # Schedule staggered updates using async tasks
     for index, entity in enumerate(dev):
         delay = 12 + (index * 12)
         hass.async_create_task(schedule_delayed_update(entity, delay))
@@ -229,21 +230,28 @@ class PJMSensor(SensorEntity):
 
 class CoincidentPeakPredictionSensor(SensorEntity):
     """
-    This sensor predicts PJM system coincident peaks at the start of the hour.
+    This sensor predicts PJM (or zone) coincident peaks using a piecewise quadratic regression.
     
-    It uses real-time load data (via the shared PJMData instance), tracks a rolling load history,
-    and performs quadratic regression to forecast the peak load and its arrival time.
+    Methodology:
+      1. Collect load data every 5 minutes and maintain a rolling history.
+      2. Compute the second derivative of the load history (after smoothing if needed).
+      3. Detect up to two consecutive turning points:
+         - The first turning point (around 5–6 AM) marks the end of the initial morning behavior.
+         - The second turning point (e.g., around 3 PM) marks a further change toward peak behavior.
+      4. Divide the data into segments based on these turning points.
+      5. Fit a quadratic model for each segment.
+         - The final segment (after the last turning point) is used to extrapolate and predict the peak.
+         - Optionally, apply weighted least squares on the final segment so that later data points influence the prediction more.
+      6. The predicted peak load (and its time) is stored as the sensor state.
+      7. Additional attributes include:
+         - `predicted_peak_time`
+         - `forecasted_peak_today` (True if the predicted peak is for today and meets the effective threshold)
+         - `peak_hour_active` (True during the full hour when the predicted peak occurs)
     
-    In addition, it now provides:
-      - A boolean attribute 'forecasted_peak_today' that is true all day if a valid forecast
-        (i.e. a predicted peak load meeting or exceeding the effective threshold) indicates that the peak
-        will occur today.
-      - A boolean attribute 'peak_hour_active' that is true for the entire hour when the predicted peak occurs,
-        again only if the predicted peak meets or exceeds the effective threshold.
-    
-    The historical peaks list (top 5) is reset on October 1st.
+    Historical peaks are updated and reset on October 1st.
     """
     def __init__(self, pjm_data, zone, peak_threshold, accuracy_threshold, sensor_type):
+        super().__init__()
         self._pjm_data = pjm_data
         self._zone = zone
         self._sensor_type = sensor_type  # Either CONF_COINCIDENT_PEAK_PREDICTION_ZONE or _SYSTEM
@@ -252,33 +260,34 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         self._unit_of_measurement = "MW"
         self._state = None
 
-        # Configuration thresholds
+        # Configuration thresholds (used for gating extra attributes)
         self._user_defined_threshold = peak_threshold
         self._accuracy_threshold = accuracy_threshold
 
-        # Increase the load history to 300 data points (approx. 25 hours)
-        self._load_history = deque(maxlen=300)
+        # Rolling load history (timestamp, load) – up to ~25 hours
+        self._load_history = deque(maxlen=MAX_HISTORY_SIZE)
         self._historical_peaks = []
         self._historical_peak_accuracy = []
 
-        # New attributes for peak prediction
+        # Extra attributes
         self._forecasted_peak_today = False
         self._peak_hour_active = False
         self._predicted_peak_time = None
 
     @property
     def extra_state_attributes(self):
-        return {
+        attr = {
             "predicted_peak": self._state,
             "predicted_peak_time": self._predicted_peak_time.isoformat() if self._predicted_peak_time else None,
             "forecasted_peak_today": self._forecasted_peak_today,
             "peak_hour_active": self._peak_hour_active,
+            "historical_peaks": self._historical_peaks,
+            "load_history": [(ts.isoformat(), load) for ts, load in self._load_history],
             "accuracy_probability_percent": round(self._compute_accuracy_probability() * 100, 1)
                 if self._historical_peak_accuracy else "N/A",
-            "load_history": [(ts.isoformat(), load) for ts, load in self._load_history],
-            "historical_peaks": self._historical_peaks,
         }
-        
+        return attr
+
     @Throttle(MIN_TIME_BETWEEN_UPDATES_INSTANTANEOUS)
     async def async_update(self):
         # 1. Retrieve current load
@@ -291,158 +300,160 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         self._load_history.append((now_utc, load))
         _LOGGER.debug("Peak predictor: added load %s MW at %s", load, now_utc.isoformat())
 
-        # Reset historical peaks on October 1st (local time)
+        # Reset historical peaks on October 1st
         now_local = datetime.now().astimezone()
         if now_local.month == 10 and now_local.day == 1:
             self._historical_peaks = []
             _LOGGER.debug("Historical peaks reset on October 1st.")
 
-        # If insufficient data (e.g. fewer than 12 points), do not predict yet.
+        # Require at least 12 data points
         if len(self._load_history) < 12:
-            # Not enough data to perform a quadratic regression yet;
-            # keep showing the current load.
             self._state = load
             self._forecasted_peak_today = False
             self._peak_hour_active = False
             return
 
-        # 2. Find the most recent local minimum ("turning point")
-        local_min_index = self._find_local_minimum_index()
-        if local_min_index is None:
-            _LOGGER.debug("No local minimum detected in the current load history.")
-            self._state = load  # still insufficient info to forecast peak accurately
-            self._forecasted_peak_today = False
-            self._peak_hour_active = False
-            return
+        # Convert load history to arrays: times (in hours from first sample) and loads
+        base_time = self._load_history[0][0]
+        times = np.array([(ts - base_time).total_seconds() / 3600.0 for ts, _ in self._load_history])
+        loads = np.array([val for _, val in self._load_history])
 
-        # 3. Build regression dataset from the local minimum to now
-        times = []
-        loads = []
-        t0 = self._load_history[local_min_index][0]
-        for t, l in list(self._load_history)[local_min_index:]:
-            delta_minutes = (t - t0).total_seconds() / 60.0
-            times.append(delta_minutes)
-            loads.append(l)
-        if len(times) < 3:
-            _LOGGER.debug("Not enough data for quadratic regression.")
+        # 2. Detect turning points via second derivative analysis
+        turning_indices = self._detect_turning_points(times, loads)
+        # We expect at least one turning point; if none, fallback to single quadratic fit.
+        if len(turning_indices) == 0:
+            t_peak, peak_load = self._fit_single_quadratic(times, loads)
+        else:
+            t_peak, peak_load = self._fit_piecewise_quadratic(times, loads, turning_indices)
+
+        if t_peak is None or peak_load is None:
             self._state = load
             self._forecasted_peak_today = False
             self._peak_hour_active = False
             return
 
-        try:
-            # Fit a quadratic: load = A*t^2 + B*t + C
-            coeffs = np.polyfit(times, loads, 2)
-            A, B, C = coeffs
-            _LOGGER.debug("Quadratic coefficients: A=%.4f, B=%.4f, C=%.4f", A, B, C)
-        except Exception as e:
-            _LOGGER.error("Quadratic regression failed: %s", e)
-            self._state = load
-            self._forecasted_peak_today = False
-            self._peak_hour_active = False
-            return
+        # 3. Save predicted peak load as sensor state
+        self._state = round(peak_load)
 
-        # 4. Ensure the curve is concave down (A < 0)
-        if A >= 0:
-            _LOGGER.debug("Curve not concave down (A=%.4f). No peak forming.", A)
-            self._state = load
-            self._forecasted_peak_today = False
-            self._peak_hour_active = False
-            return
+        # 4. Compute predicted peak datetime
+        predicted_peak_datetime = base_time + timedelta(hours=t_peak)
+        self._predicted_peak_time = predicted_peak_datetime.astimezone()
 
-        # 5. Calculate predicted time (in minutes from t0) when the derivative is zero (i.e. the peak)
-        t_peak = -B / (2 * A)
-        if t_peak <= times[-1]:
-            _LOGGER.debug("Predicted peak time (%.2f minutes) already passed.", t_peak)
-            self._state = load
-            self._forecasted_peak_today = False
-            self._peak_hour_active = False
-            return
-
-        predicted_peak_load = A * t_peak**2 + B * t_peak + C
-        _LOGGER.debug("Predicted peak load: %.2f MW, calculated from t_peak=%.2f minutes", predicted_peak_load, t_peak)
-
-        # 6. Compute the effective threshold for additional attributes.
+        # 5. Set extra attributes based on effective threshold
         effective_threshold = max(self._user_defined_threshold, self._get_fifth_highest_peak())
-        _LOGGER.debug("Effective threshold used: %.2f MW", effective_threshold)
-
-        # 7. Compute the predicted peak datetime (using t0 from the local minimum)
-        predicted_peak_time = t0 + timedelta(minutes=t_peak)
-        self._predicted_peak_time = predicted_peak_time.astimezone()
-
-        # 8. Always return the predicted peak load as the sensor state.
-        self._state = round(predicted_peak_load)
-
-        # 9. Set the 'forecasted_peak_today' attribute based on threshold and timing.
-        #    Only if the predicted peak load meets/exceeds the effective threshold.
-        if predicted_peak_load >= effective_threshold and (self._predicted_peak_time.date() == now_local.date()):
+        if peak_load >= effective_threshold and (self._predicted_peak_time.date() == now_local.date()):
             self._forecasted_peak_today = True
         else:
             self._forecasted_peak_today = False
 
-        # 10. Set the 'peak_hour_active' attribute.
-        #    It will be True only during the full hour when the predicted peak is expected,
-        #    and only if the predicted peak load meets/exceeds the effective threshold.
         predicted_peak_hour = self._predicted_peak_time.replace(minute=0, second=0, microsecond=0)
-        if predicted_peak_load >= effective_threshold and (predicted_peak_hour <= now_local < (predicted_peak_hour + timedelta(hours=1))):
+        if peak_load >= effective_threshold and (predicted_peak_hour <= now_local < predicted_peak_hour + timedelta(hours=1)):
             self._peak_hour_active = True
         else:
             self._peak_hour_active = False
 
-        # 11. Update historical peaks if this load qualifies.
+        # 6. Update historical peaks and accuracy (omitted detailed logic for brevity)
         self._update_historical_peaks(load)
-
-        # 12. Update historical prediction accuracy (if within the first 5 minutes of the hour)
         if now_local.minute < 5:
-            accuracy = 1 if abs(load - predicted_peak_load) < 5000 else 0
+            accuracy = 1 if abs(load - peak_load) < 5000 else 0
             self._historical_peak_accuracy.append(accuracy)
             if len(self._historical_peak_accuracy) > 20:
                 self._historical_peak_accuracy.pop(0)
 
-    def _find_local_minimum_index(self):
-        """Identify a true turning point using an adaptive threshold for system vs zone."""
-        data = list(self._load_history)
-        if len(data) < 10:
-            return None
+    def _detect_turning_points(self, times, loads):
+        """
+        Detect turning points based on the second derivative.
+        We'll smooth the data and look for zero-crossings in the second derivative
+        (i.e. where acceleration changes from positive to negative).
+        We return a list of indices in the 'times' array.
+        """
+        if len(times) < 5:
+            return []
 
-        window_size = 5  # Smooths out noise in detection
-        load_changes = [abs(data[i][1] - data[i-1][1]) for i in range(1, len(data))]
+        # Compute first derivative
+        dt = np.diff(times)
+        dload = np.diff(loads)
+        first_deriv = dload / dt
 
-        # Determine zone peak load to scale the threshold
-        recent_loads = [data[i][1] for i in range(-50, -1)] if len(data) > 50 else [d[1] for d in data]
-        zone_peak_load = max(recent_loads)
+        # Compute second derivative (without further smoothing for now)
+        second_deriv = np.diff(first_deriv) / dt[:-1]
 
-        # Compute adaptive threshold based on system vs zone
-        adaptive_threshold = max(np.percentile(load_changes, 90) * 2, 0.01 * zone_peak_load, 100)
+        # Find indices where second derivative goes from positive to negative
+        turning_indices = []
+        for i in range(1, len(second_deriv)):
+            if second_deriv[i-1] > 0 and second_deriv[i] < 0:
+                turning_indices.append(i + 1)  # +1 for index shift due to diff
 
-        for i in range(len(data) - window_size - 1, window_size, -1):  
-            loads = [data[j][1] for j in range(i - window_size, i + window_size + 1)]
-            curr_load = data[i][1]
+        # Optionally, filter turning points that are too close together
+        filtered = []
+        min_gap = 1.0  # hours (adjust as needed)
+        for idx in turning_indices:
+            if not filtered or (times[idx] - times[filtered[-1]]) >= min_gap:
+                filtered.append(idx)
+        # Return at most 2 turning points (e.g., ~6 AM and ~3 PM)
+        return filtered[:2]
 
-            # 1. Ensure this point is the lowest within the rolling window
-            if curr_load != min(loads):
-                continue
+    def _fit_single_quadratic(self, times, loads):
+        """Fallback: Fit a single quadratic model to the entire load history."""
+        if len(times) < 3:
+            return None, None
+        try:
+            popt, _ = curve_fit(_quadratic, times, loads)
+            a, b, c = popt
+            if a >= 0:
+                return None, None
+            t_peak = -b / (2 * a)
+            if t_peak < 0 or t_peak > times[-1] + 6:
+                return None, None
+            peak_load = _quadratic(t_peak, a, b, c)
+            return t_peak, peak_load
+        except Exception as exc:
+            _LOGGER.error("Single quadratic fit failed: %s", exc)
+            return None, None
 
-            # 2. Ensure the drop before the minimum is significant
-            if (data[i - 1][1] - curr_load) < adaptive_threshold:
-                continue
+    def _fit_piecewise_quadratic(self, times, loads, turning_indices):
+        """
+        Fit piecewise quadratic models based on detected turning points.
+        If one turning point is detected, split the data into two segments.
+        If two are detected, split into three segments.
+        We use the final segment to predict the peak (ensuring it is concave down).
+        """
+        segments = []
+        prev_idx = 0
+        for idx in turning_indices:
+            segments.append((prev_idx, idx))
+            prev_idx = idx
+        segments.append((prev_idx, len(times)-1))
 
-            # 3. Use second derivative check
-            times = [(data[j][0] - data[i][0]).total_seconds() / 60.0 for j in range(i - window_size, i + window_size + 1)]
-            poly_coeffs = np.polyfit(times, loads, 2)
-            A = poly_coeffs[0]
+        predicted_peak_time = None
+        predicted_peak_load = None
 
-            if A > 0:
-                return i  # Found a valid local minimum
-
-        return None  # No valid local min found
-
+        # Fit each segment individually.
+        # For simplicity, we only use the final segment to predict the peak.
+        for i, (start, end) in enumerate(segments):
+            if end - start + 1 < 3:
+                continue  # Not enough data
+            seg_times = times[start:end+1]
+            seg_loads = loads[start:end+1]
+            try:
+                popt, _ = curve_fit(_quadratic, seg_times, seg_loads)
+                a, b, c = popt
+                if i == len(segments)-1 and a < 0:
+                    t_peak = -b / (2 * a)
+                    # Check that the predicted peak is in a plausible range:
+                    if t_peak < seg_times[0] or t_peak > seg_times[-1] + 6:
+                        continue
+                    peak_load = _quadratic(t_peak, a, b, c)
+                    predicted_peak_time = t_peak
+                    predicted_peak_load = peak_load
+            except Exception as exc:
+                _LOGGER.error("Piecewise quadratic fit segment %d failed: %s", i, exc)
+        return predicted_peak_time, predicted_peak_load
 
     def _get_fifth_highest_peak(self):
         if len(self._historical_peaks) < 5:
             return self._user_defined_threshold
-        sorted_peaks = sorted(self._historical_peaks, reverse=True)
-        return sorted_peaks[4]
+        return sorted(self._historical_peaks, reverse=True)[4]
 
     def _update_historical_peaks(self, load):
         if load > self._user_defined_threshold:
@@ -460,7 +471,7 @@ class PJMData:
     """Get and parse data from PJM with coordinated API rate limiting using your API key or fetched subscription key."""
     def __init__(self, websession, api_key):
         self._websession = websession
-        self._subscription_key = api_key  # Use provided API key; if not provided, we'll fetch one.
+        self._subscription_key = api_key
         self._request_times = []
         self._lock = asyncio.Lock()
 
@@ -478,14 +489,12 @@ class PJMData:
             self._request_times.append(now)
 
     def _get_headers(self):
-        headers = {
+        return {
             'Ocp-Apim-Subscription-Key': self._subscription_key,
             'Content-Type': 'application/json',
         }
-        return headers
 
     async def _get_subscription_key(self):
-        """Fetch the subscription key if no API key was provided."""
         if self._subscription_key:
             return
         try:
@@ -562,7 +571,8 @@ class PJMData:
                 data = full_data["items"]
                 forecast_data = []
                 for item in data:
-                    forecast_hour_ending = datetime.strptime(item['forecast_datetime_ending_utc'], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc).astimezone()
+                    forecast_hour_ending = datetime.strptime(item['forecast_datetime_ending_utc'], '%Y-%m-%dT%H:%M:%S') \
+                        .replace(tzinfo=timezone.utc).astimezone()
                     forecast_data.append({
                         "forecast_hour_ending": forecast_hour_ending,
                         "forecast_load_mw": int(item["forecast_load_mw"])
@@ -598,12 +608,14 @@ class PJMData:
                     data, 
                     key=lambda x: (
                         x["forecast_load_mw"] * -1, 
-                        datetime.strptime(x['forecast_datetime_ending_utc'],'%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc).astimezone()
+                        datetime.strptime(x['forecast_datetime_ending_utc'],'%Y-%m-%dT%H:%M:%S')
+                        .replace(tzinfo=timezone.utc).astimezone()
                     )
                 )
                 if sorted_data:
                     load = int(sorted_data[0]["forecast_load_mw"])
-                    forecast_hour_ending = datetime.strptime(sorted_data[0]['forecast_datetime_ending_utc'],'%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc).astimezone()
+                    forecast_hour_ending = datetime.strptime(sorted_data[0]['forecast_datetime_ending_utc'],
+                        '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc).astimezone()
                     unix_time = forecast_hour_ending.timestamp()
                     return (load, unix_time)
                 return (None, None)
