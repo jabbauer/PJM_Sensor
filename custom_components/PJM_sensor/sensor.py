@@ -278,7 +278,8 @@ class CoincidentPeakPredictionSensor(SensorEntity):
             "load_history": [(ts.isoformat(), load) for ts, load in self._load_history],
             "historical_peaks": self._historical_peaks,
         }
-
+        
+    @Throttle(MIN_TIME_BETWEEN_UPDATES_INSTANTANEOUS)
     async def async_update(self):
         # 1. Retrieve current load
         load = await self._pjm_data.async_update_instantaneous(self._zone)
@@ -399,14 +400,43 @@ class CoincidentPeakPredictionSensor(SensorEntity):
                 self._historical_peak_accuracy.pop(0)
 
     def _find_local_minimum_index(self):
+        """Identify a true turning point using an adaptive threshold for system vs zone."""
         data = list(self._load_history)
-        for i in range(len(data) - 2, 0, -1):
-            _, load_prev = data[i - 1]
-            _, load_curr = data[i]
-            _, load_next = data[i + 1]
-            if (load_curr - load_prev) < 0 and (load_next - load_curr) > 0:
-                return i
-        return None
+        if len(data) < 10:
+            return None
+
+        window_size = 5  # Smooths out noise in detection
+        load_changes = [abs(data[i][1] - data[i-1][1]) for i in range(1, len(data))]
+
+        # Determine zone peak load to scale the threshold
+        recent_loads = [data[i][1] for i in range(-50, -1)] if len(data) > 50 else [d[1] for d in data]
+        zone_peak_load = max(recent_loads)
+
+        # Compute adaptive threshold based on system vs zone
+        adaptive_threshold = max(np.percentile(load_changes, 90) * 2, 0.01 * zone_peak_load, 100)
+
+        for i in range(len(data) - window_size - 1, window_size, -1):  
+            loads = [data[j][1] for j in range(i - window_size, i + window_size + 1)]
+            curr_load = data[i][1]
+
+            # 1. Ensure this point is the lowest within the rolling window
+            if curr_load != min(loads):
+                continue
+
+            # 2. Ensure the drop before the minimum is significant
+            if (data[i - 1][1] - curr_load) < adaptive_threshold:
+                continue
+
+            # 3. Use second derivative check
+            times = [(data[j][0] - data[i][0]).total_seconds() / 60.0 for j in range(i - window_size, i + window_size + 1)]
+            poly_coeffs = np.polyfit(times, loads, 2)
+            A = poly_coeffs[0]
+
+            if A > 0:
+                return i  # Found a valid local minimum
+
+        return None  # No valid local min found
+
 
     def _get_fifth_highest_peak(self):
         if len(self._historical_peaks) < 5:
