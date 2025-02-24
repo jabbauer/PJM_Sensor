@@ -10,7 +10,7 @@ available; otherwise, they'll fall back to fetching the subscription key.
 """
 
 import asyncio
-from collections import deque
+from collections import deque, defaultdict
 from datetime import datetime, date, time, timezone, timedelta
 import logging
 import urllib.parse
@@ -227,31 +227,27 @@ class PJMSensor(SensorEntity):
         if lmp is not None:
             self._state = lmp
 
-
 class CoincidentPeakPredictionSensor(SensorEntity):
     """
-    This sensor predicts PJM (or zone) coincident peaks using a piecewise quadratic regression.
+    This sensor predicts PJM (or zone) coincident peaks using a multi‑source
+    forecasting approach with exponential smoothing. It uses:
     
-    Methodology:
-      1. Collect load data every 5 minutes and maintain a rolling history.
-      2. Compute the second derivative of the load history (after smoothing if needed).
-      3. Detect up to two consecutive turning points:
-         - The first turning point (around 5–6 AM) marks the end of the initial morning behavior.
-         - The second turning point (e.g., around 3 PM) marks a further change toward peak behavior.
-      4. Divide the data into segments based on these turning points.
-      5. Fit a quadratic model for each segment.
-         - The final segment (after the last turning point) is used to extrapolate and predict the peak.
-         - Optionally, apply weighted least squares on the final segment so that later data points influence the prediction more.
-      6. The predicted peak load (and its time) is stored as the sensor state.
-      7. Additional attributes include:
-         - `predicted_peak_time`
-         - `forecasted_peak_today` (True if the predicted peak is for today and meets the effective threshold)
-         - `peak_hour_active` (True during the full hour when the predicted peak occurs)
+      • The PJM Five Minute Load Forecast as a base,
+      • Real‐time instantaneous load data to refine the forecast (via exponential smoothing),
+      • A seven‑day forecast to provide a daily peak estimate.
+      
+    When within the 2‑hour window of the daily forecast peak, it also calculates the
+    instantaneous rate of change and acceleration using a short rolling window and
+    (optionally) applies a quadratic regression to dynamically adjust the prediction.
     
-    Historical peaks are updated and reset on October 1st.
+    The sensor maintains daily refined forecasts, updates historical peaks, and flags:
+      - forecasted_peak_today (True if today’s predicted peak exceeds an effective threshold),
+      - peak_hour_active (True if the current hour matches the predicted peak hour).
+      
+    Daily forecast data is reset at midnight, and historical peaks are reset on October 1st.
     """
     def __init__(self, pjm_data, zone, peak_threshold, accuracy_threshold, sensor_type):
-        super().__init__()
+        super().__init__()  # Initialize base SensorEntity
         self._pjm_data = pjm_data
         self._zone = zone
         self._sensor_type = sensor_type  # Either CONF_COINCIDENT_PEAK_PREDICTION_ZONE or _SYSTEM
@@ -260,200 +256,241 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         self._unit_of_measurement = "MW"
         self._state = None
 
-        # Configuration thresholds (used for gating extra attributes)
+        # Configuration thresholds
         self._user_defined_threshold = peak_threshold
         self._accuracy_threshold = accuracy_threshold
 
-        # Rolling load history (timestamp, load) – up to ~25 hours
-        self._load_history = deque(maxlen=MAX_HISTORY_SIZE)
-        self._historical_peaks = []
-        self._historical_peak_accuracy = []
+        # Data storage (rolling history and forecast collections)
+        self._load_history = deque(maxlen=MAX_HISTORY_SIZE)         # Instantaneous load history (~25 hours)
+        self._daily_forecast = []                                   # List of tuples: (local_datetime, refined_load)
+        self._actual_daily_peaks = {}                               # {date: peak_load} from actual loads
+        self._forecasted_daily_peaks = {}                           # {date: peak_load} from seven-day forecast
+        self._forecasted_daily_peak_time = {}                       # {date: peak_time} from seven-day forecast
+        self._top_five_peaks = []                                   # Combined list of top five peaks
+        self._historical_peak_accuracy = []                         # For accuracy tracking
+        self._short_forecast_history = []                           # Store last few short-term forecasts
 
-        # Extra attributes
+        # Extra attributes for peak prediction
         self._forecasted_peak_today = False
         self._peak_hour_active = False
         self._predicted_peak_time = None
+        self._refined_forecast = None
+
+    @property
+    def icon(self):
+            return "mdi:summit"
 
     @property
     def extra_state_attributes(self):
-        attr = {
+        return {
             "predicted_peak": self._state,
             "predicted_peak_time": self._predicted_peak_time.isoformat() if self._predicted_peak_time else None,
             "forecasted_peak_today": self._forecasted_peak_today,
             "peak_hour_active": self._peak_hour_active,
-            "historical_peaks": self._historical_peaks,
+            "historical_peaks": list(self._actual_daily_peaks.values()) + list(self._forecasted_daily_peaks.values()),
+            "top_five_peaks": self._top_five_peaks,
             "load_history": [(ts.isoformat(), load) for ts, load in self._load_history],
+            "short_forecast_history": [(dt.isoformat(), load) for dt, load in self._short_forecast_history],
             "accuracy_probability_percent": round(self._compute_accuracy_probability() * 100, 1)
                 if self._historical_peak_accuracy else "N/A",
         }
-        return attr
 
-    @Throttle(MIN_TIME_BETWEEN_UPDATES_INSTANTANEOUS)
     async def async_update(self):
-        # 1. Retrieve current load
+        """
+        Update the sensor:
+          1. Pull instantaneous load.
+          2. Retrieve the short-term forecast (next 2 hours) and record it.
+          3. Update refined forecast using exponential smoothing.
+          4. Periodically (hourly) update the seven-day daily peak forecast.
+          5. Update actual daily peaks from load history.
+          6. Update top five peaks from combined historical and forecasted peaks.
+          7. If within the 2-hour window of the daily forecast peak, compute rate-of-change and (optionally)
+             apply quadratic regression to dynamically adjust the prediction.
+          8. Blend the short-term forecast and any dynamic prediction.
+          9. Set the sensor state and extra attributes accordingly.
+        """
+        # 1. Retrieve instantaneous load.
         load = await self._pjm_data.async_update_instantaneous(self._zone)
         if load is None:
             _LOGGER.error("No load data received for peak prediction")
             return
-
         now_utc = datetime.now(timezone.utc)
+        now_local = now_utc.astimezone()
         self._load_history.append((now_utc, load))
-        _LOGGER.debug("Peak predictor: added load %s MW at %s", load, now_utc.isoformat())
 
-        # Reset historical peaks on October 1st
-        now_local = datetime.now().astimezone()
-        if now_local.month == 10 and now_local.day == 1:
-            self._historical_peaks = []
-            _LOGGER.debug("Historical peaks reset on October 1st.")
+        # Maintain a short history for rate-of-change calculations.
+        if len(self._load_history) > 5:
+            self._load_history.popleft()
 
-        # Require at least 12 data points
-        if len(self._load_history) < 12:
-            self._state = load
-            self._forecasted_peak_today = False
-            self._peak_hour_active = False
-            return
-
-        # Convert load history to arrays: times (in hours from first sample) and loads
-        base_time = self._load_history[0][0]
-        times = np.array([(ts - base_time).total_seconds() / 3600.0 for ts, _ in self._load_history])
-        loads = np.array([val for _, val in self._load_history])
-
-        # 2. Detect turning points via second derivative analysis
-        turning_indices = self._detect_turning_points(times, loads)
-        # We expect at least one turning point; if none, fallback to single quadratic fit.
-        if len(turning_indices) == 0:
-            t_peak, peak_load = self._fit_single_quadratic(times, loads)
+        # 2. Retrieve short-term forecast (assumed to return a list of dicts with keys "load" and "timestamp")
+        short_forecast_data = await self._pjm_data.async_update_short_forecast(self._zone)
+        if short_forecast_data and isinstance(short_forecast_data, list):
+            latest_forecast = short_forecast_data[0]
+            short_peak_load = latest_forecast["load"]
+            short_peak_time = datetime.fromtimestamp(latest_forecast["timestamp"], tz=timezone.utc).astimezone()
+            # Record in short forecast history.
+            self._short_forecast_history.append((short_peak_time, short_peak_load))
+            if len(self._short_forecast_history) > 5:
+                self._short_forecast_history.pop(0)
         else:
-            t_peak, peak_load = self._fit_piecewise_quadratic(times, loads, turning_indices)
+            short_peak_load = None
+            short_peak_time = None
 
-        if t_peak is None or peak_load is None:
+        # 3. Reset daily forecast if day has changed.
+        if not self._daily_forecast or (self._daily_forecast and now_local.date() != self._daily_forecast[0][0].date()):
+            self._daily_forecast = []
+            # Initialize with short-term forecast if available.
+            if short_peak_load is not None:
+                self._refined_forecast = short_peak_load
+                self._daily_forecast.append((short_peak_time, self._refined_forecast))
+            else:
+                self._refined_forecast = load
+
+        # 4. Update refined forecast using exponential smoothing.
+        alpha = 0.2
+        if self._refined_forecast is None:
+            self._refined_forecast = load
+        else:
+            self._refined_forecast = alpha * load + (1 - alpha) * self._refined_forecast
+        self._daily_forecast.append((now_local, self._refined_forecast))
+
+        # 5. Every hour, update the seven-day forecast.
+        if now_local.minute == 0:
+            seven_day_forecast = await self._pjm_data.async_update_forecast(self._zone)
+            if seven_day_forecast:
+                self._update_forecasted_daily_peaks(seven_day_forecast)
+
+        # 6. Update actual daily peaks from load history.
+        self._update_actual_daily_peaks(now_local)
+
+        # 7. Update top five peaks.
+        self._update_top_five_peaks()
+
+        # 8. Determine predicted peak for today.
+        today = now_local.date()
+        # Get maximum refined forecast (from entries later than now) from today's forecast.
+        refined_candidates = [(dt, val) for dt, val in self._daily_forecast if dt.date() == today and dt > now_local]
+        if refined_candidates:
+            st_time, st_load = max(refined_candidates, key=lambda x: x[1])
+        else:
+            st_time, st_load = None, 0
+
+        # Retrieve daily forecast peak (from seven-day forecast) if available.
+        df_load = self._forecasted_daily_peaks.get(today, 0)
+        df_time = self._forecasted_daily_peak_time.get(today, None)
+
+        # 9. Determine if we're inside the 2-hour window of the daily forecast peak.
+        inside_two_hour = False
+        if df_time and short_peak_time:
+            if (df_time - now_local) < timedelta(hours=2):
+                inside_two_hour = True
+
+        # 10. If inside the 2-hour window, use instantaneous load dynamics.
+        if inside_two_hour and len(self._load_history) >= 3:
+            # Calculate rate-of-change and acceleration from the last few instantaneous load readings.
+            times_arr = np.array([(ts - self._load_history[0][0]).total_seconds() / 3600.0 for ts, _ in self._load_history])
+            loads_arr = np.array([val for _, val in self._load_history])
+            dt = np.diff(times_arr)
+            dload = np.diff(loads_arr)
+            rate_of_change = dload / dt
+            if len(rate_of_change) > 1:
+                acceleration = np.diff(rate_of_change) / dt[:-1]
+                avg_acceleration = np.mean(acceleration)
+            else:
+                avg_acceleration = 0
+
+            # Optionally, use quadratic regression on recent data to project a peak.
+            try:
+                popt, _ = curve_fit(_quadratic, times_arr, loads_arr)
+                a, b, c = popt
+                if a < 0:
+                    proj_peak_time_offset = -b / (2 * a)
+                    proj_peak_load = _quadratic(proj_peak_time_offset, a, b, c)
+                    # Convert offset to absolute datetime:
+                    proj_peak_time = now_utc + timedelta(hours=proj_peak_time_offset)
+                else:
+                    proj_peak_time, proj_peak_load = None, None
+            except Exception as exc:
+                _LOGGER.error("Quadratic regression during 2-hr window failed: %s", exc)
+                proj_peak_time, proj_peak_load = None, None
+
+            # 11. Blending Logic: If the quadratic projection and short forecast differ,
+            # blend them. Also, always prioritize short-term forecast inside the 2-hour window.
+            if proj_peak_time and proj_peak_load and short_peak_load is not None:
+                if abs(proj_peak_load - short_peak_load) > 500:
+                    final_peak_time = proj_peak_time
+                    final_peak_load = (proj_peak_load + short_peak_load) / 2
+                else:
+                    final_peak_time, final_peak_load = short_peak_time, short_peak_load
+            else:
+                final_peak_time, final_peak_load = short_peak_time, short_peak_load
+        else:
+            # Outside the 2-hour window, use daily forecast.
+            final_peak_time, final_peak_load = df_time, df_load
+
+        # 12. Update the sensor state.
+        if final_peak_time is not None and final_peak_load:
+            self._predicted_peak_time = final_peak_time
+            self._state = round(final_peak_load)
+        else:
+            self._predicted_peak_time = None
             self._state = load
-            self._forecasted_peak_today = False
-            self._peak_hour_active = False
-            return
 
-        # 3. Save predicted peak load as sensor state
-        self._state = round(peak_load)
-
-        # 4. Compute predicted peak datetime
-        predicted_peak_datetime = base_time + timedelta(hours=t_peak)
-        self._predicted_peak_time = predicted_peak_datetime.astimezone()
-
-        # 5. Set extra attributes based on effective threshold
+        # 13. Set flags based on an effective threshold.
         effective_threshold = max(self._user_defined_threshold, self._get_fifth_highest_peak())
-        if peak_load >= effective_threshold and (self._predicted_peak_time.date() == now_local.date()):
+        if self._predicted_peak_time and final_peak_load >= effective_threshold and (self._predicted_peak_time.date() == today):
             self._forecasted_peak_today = True
         else:
             self._forecasted_peak_today = False
 
-        predicted_peak_hour = self._predicted_peak_time.replace(minute=0, second=0, microsecond=0)
-        if peak_load >= effective_threshold and (predicted_peak_hour <= now_local < predicted_peak_hour + timedelta(hours=1)):
-            self._peak_hour_active = True
+        if self._predicted_peak_time:
+            predicted_peak_hour = self._predicted_peak_time.replace(minute=0, second=0, microsecond=0)
+            if final_peak_load >= effective_threshold and (predicted_peak_hour <= now_local < predicted_peak_hour + timedelta(hours=1)):
+                self._peak_hour_active = True
+            else:
+                self._peak_hour_active = False
         else:
             self._peak_hour_active = False
 
-        # 6. Update historical peaks and accuracy (omitted detailed logic for brevity)
+        # 14. Update historical peaks and accuracy.
         self._update_historical_peaks(load)
         if now_local.minute < 5:
-            accuracy = 1 if abs(load - peak_load) < 5000 else 0
+            accuracy = 1 if abs(load - final_peak_load) < 5000 else 0
             self._historical_peak_accuracy.append(accuracy)
             if len(self._historical_peak_accuracy) > 20:
                 self._historical_peak_accuracy.pop(0)
 
-    def _detect_turning_points(self, times, loads):
-        """
-        Detect turning points based on the second derivative.
-        We'll smooth the data and look for zero-crossings in the second derivative
-        (i.e. where acceleration changes from positive to negative).
-        We return a list of indices in the 'times' array.
-        """
-        if len(times) < 5:
-            return []
+    def _update_actual_daily_peaks(self, now_local):
+        today = now_local.date()
+        today_start = datetime.combine(today, time.min).astimezone(timezone.utc)
+        todays_loads = [load for ts, load in self._load_history if ts >= today_start]
+        if todays_loads:
+            self._actual_daily_peaks[today] = max(todays_loads)
+            _LOGGER.debug("Updated actual daily peak for %s: %s MW", today, self._actual_daily_peaks[today])
 
-        # Compute first derivative
-        dt = np.diff(times)
-        dload = np.diff(loads)
-        first_deriv = dload / dt
+    def _update_forecasted_daily_peaks(self, seven_day_forecast):
+        daily_peaks = defaultdict(list)
+        daily_peak_times = {}
+        for item in seven_day_forecast:
+            dt = item["forecast_hour_ending"].date()
+            load = item["forecast_load_mw"]
+            daily_peaks[dt].append(load)
+            if dt not in daily_peak_times or load > daily_peak_times[dt][1]:
+                daily_peak_times[dt] = (item["forecast_hour_ending"], load)
+        for dt, loads in daily_peaks.items():
+            self._forecasted_daily_peaks[dt] = max(loads)
+        self._forecasted_daily_peak_time = {dt: daily_peak_times[dt][0] for dt in daily_peak_times}
+        _LOGGER.debug("Updated forecasted daily peaks: %s", self._forecasted_daily_peaks)
 
-        # Compute second derivative (without further smoothing for now)
-        second_deriv = np.diff(first_deriv) / dt[:-1]
-
-        # Find indices where second derivative goes from positive to negative
-        turning_indices = []
-        for i in range(1, len(second_deriv)):
-            if second_deriv[i-1] > 0 and second_deriv[i] < 0:
-                turning_indices.append(i + 1)  # +1 for index shift due to diff
-
-        # Optionally, filter turning points that are too close together
-        filtered = []
-        min_gap = 1.0  # hours (adjust as needed)
-        for idx in turning_indices:
-            if not filtered or (times[idx] - times[filtered[-1]]) >= min_gap:
-                filtered.append(idx)
-        # Return at most 2 turning points (e.g., ~6 AM and ~3 PM)
-        return filtered[:2]
-
-    def _fit_single_quadratic(self, times, loads):
-        """Fallback: Fit a single quadratic model to the entire load history."""
-        if len(times) < 3:
-            return None, None
-        try:
-            popt, _ = curve_fit(_quadratic, times, loads)
-            a, b, c = popt
-            if a >= 0:
-                return None, None
-            t_peak = -b / (2 * a)
-            if t_peak < 0 or t_peak > times[-1] + 6:
-                return None, None
-            peak_load = _quadratic(t_peak, a, b, c)
-            return t_peak, peak_load
-        except Exception as exc:
-            _LOGGER.error("Single quadratic fit failed: %s", exc)
-            return None, None
-
-    def _fit_piecewise_quadratic(self, times, loads, turning_indices):
-        """
-        Fit piecewise quadratic models based on detected turning points.
-        If one turning point is detected, split the data into two segments.
-        If two are detected, split into three segments.
-        We use the final segment to predict the peak (ensuring it is concave down).
-        """
-        segments = []
-        prev_idx = 0
-        for idx in turning_indices:
-            segments.append((prev_idx, idx))
-            prev_idx = idx
-        segments.append((prev_idx, len(times)-1))
-
-        predicted_peak_time = None
-        predicted_peak_load = None
-
-        # Fit each segment individually.
-        # For simplicity, we only use the final segment to predict the peak.
-        for i, (start, end) in enumerate(segments):
-            if end - start + 1 < 3:
-                continue  # Not enough data
-            seg_times = times[start:end+1]
-            seg_loads = loads[start:end+1]
-            try:
-                popt, _ = curve_fit(_quadratic, seg_times, seg_loads)
-                a, b, c = popt
-                if i == len(segments)-1 and a < 0:
-                    t_peak = -b / (2 * a)
-                    # Check that the predicted peak is in a plausible range:
-                    if t_peak < seg_times[0] or t_peak > seg_times[-1] + 6:
-                        continue
-                    peak_load = _quadratic(t_peak, a, b, c)
-                    predicted_peak_time = t_peak
-                    predicted_peak_load = peak_load
-            except Exception as exc:
-                _LOGGER.error("Piecewise quadratic fit segment %d failed: %s", i, exc)
-        return predicted_peak_time, predicted_peak_load
+    def _update_top_five_peaks(self):
+        combined = list(self._actual_daily_peaks.values()) + list(self._forecasted_daily_peaks.values())
+        self._top_five_peaks = sorted(combined, reverse=True)[:5]
+        _LOGGER.debug("Updated top five peaks: %s", self._top_five_peaks)
 
     def _get_fifth_highest_peak(self):
-        if len(self._historical_peaks) < 5:
+        if len(self._top_five_peaks) < 5:
             return self._user_defined_threshold
-        return sorted(self._historical_peaks, reverse=True)[4]
+        return self._top_five_peaks[-1]
 
     def _update_historical_peaks(self, load):
         if load > self._user_defined_threshold:
