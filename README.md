@@ -10,11 +10,12 @@ A Home Assistant integration that seductively provides PJM sensor data for monit
   - **With API Key:** Unlock the full array of sensor options with higher rate limits (up to 600 requests per minute for PJM members) and enable as many sensors as you desire.  
   - **Without API Key:** The integration will automatically fetch the subscription key from PJM and restrict you to a maximum of **3 sensor entities** with a lower rate limit (approximately 6 requests per minute).
 
-- **Default Sensors:**  
-  By default, only these three alluring sensors are enabled:  
-  - **instantaneous_total_load** – PJM Instantaneous Load (updates every 5 minutes)  
-  - **total_short_forecast** – PJM 2Hr Forecast (updates every 5 minutes)  
-  - **total_load_forecast** – PJM Daily Forecast  
+Default Sensors:
+By default, only these three alluring sensors are enabled:
+
+PJM System Load – Instantaneous load data (formerly labeled as PJM Total Load; updates every 5 minutes).
+PJM 2Hr Forecast – Short-term load forecast (updates every 5 minutes). Its extra attributes now include the forecast_hour_ending (the time of the peak of the 2-hr forecast period) so you can see exactly when the forecast period concludes.
+PJM Daily System Forecast – Daily forecast sensor (formerly PJM Total Load Forecast). In addition to the maximum forecast load, this sensor now exposes forecast_hour_ending attribute indicating the hour-ending when the peak is expected.
 
 - **Additional Sensor Options (API key required):**  
   When you provide your API key, you can enable extra sensors, including:  
@@ -22,8 +23,8 @@ A Home Assistant integration that seductively provides PJM sensor data for monit
   - **zone_short_forecast** – Zonal 2Hr Forecast (5 minute update interval)  
   - **zone_load_forecast** – Zonal Daily Forecast  
   - **zonal_lmp** – Hourly Average Locational Marginal Price (LMP) for the selected zone  
-  - **coincident_peak_prediction_zone** – Coincident Peak Prediction (Zone)  
-  - **coincident_peak_prediction_system** – Coincident Peak Prediction (System)
+  - **coincident_peak_prediction_zone** – (Experimental) Coincident Peak Prediction (Zone)  
+  - **coincident_peak_prediction_system** – (Experimental) Coincident Peak Prediction (System)
 
 - **Rate Limiting:**  
   Without an API key, you're limited to a modest request rate (~6 requests per minute) to play nicely with PJM’s restrictions. Provide an API key, and you can indulge in up to 600 requests per minute if you're a PJM member.
