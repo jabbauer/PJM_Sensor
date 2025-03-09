@@ -13,9 +13,9 @@ A Home Assistant integration that seductively provides PJM sensor data for monit
 - **Default Sensors:**  
 By default, only these three alluring sensors are enabled:
 
-- **PJM System Load** – Instantaneous load data (formerly labeled as PJM Total Load; updates every 5 minutes).
-- **PJM 2Hr Forecast** – Short-term load forecast (updates every 5 minutes). Its extra attributes now include the forecast_hour_ending (the time of the peak of the 2-hr forecast period) so you can see exactly when the forecast period concludes.
-- **PJM Daily System Forecast** – Daily forecast sensor (formerly PJM Total Load Forecast). In addition to the maximum forecast load, this sensor now exposes forecast_hour_ending attribute indicating the hour-ending when the peak is expected.
+  - **PJM System Load** – Instantaneous load data (formerly labeled as PJM Total Load; updates every 5 minutes).
+  - **PJM 2Hr Forecast** – Short-term load forecast (updates every 5 minutes). Its extra attributes now include the forecast_hour_ending (the time of the peak of the 2-hr forecast period) so you can see exactly when the forecast period concludes.
+  - **PJM Daily System Forecast** – Daily forecast sensor (formerly PJM Total Load Forecast). In addition to the maximum forecast load, this sensor now exposes forecast_hour_ending attribute indicating the hour-ending when the peak is expected.
 
 - **Additional Sensor Options (API key required):**  
   When you provide your API key, you can enable extra sensors, including:  
