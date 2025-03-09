@@ -22,7 +22,7 @@ CONF_ACCURACY_THRESHOLD = "accuracy_threshold"
 
 # Default thresholds for coincident peak predictions
 DEFAULT_PEAK_THRESHOLD_ZONE = 16500  # MW
-DEFAULT_PEAK_THRESHOLD_SYSTEM = 140000  # MW
+DEFAULT_PEAK_THRESHOLD_SYSTEM = 10000  # MW
 DEFAULT_ACCURACY_THRESHOLD = 0.8
 
 # Define available zones
@@ -62,9 +62,9 @@ ZONE_TO_PNODE_ID = {
 # Define sensor types and their units
 SENSOR_TYPES = {
     CONF_INSTANTANEOUS_ZONE_LOAD: ["Zone Load", 'MW'],
-    CONF_INSTANTANEOUS_TOTAL_LOAD: ["PJM Total Load", 'MW'],
+    CONF_INSTANTANEOUS_TOTAL_LOAD: ["PJM System Load", 'MW'],
     CONF_ZONE_LOAD_FORECAST: ["Load Forecast", 'MW'],
-    CONF_TOTAL_LOAD_FORECAST: ["PJM Total Load Forecast", 'MW'],
+    CONF_TOTAL_LOAD_FORECAST: ["PJM Daily System Forecast", 'MW'],
     CONF_ZONE_SHORT_FORECAST: ["Zone 2HR Forecast", "MW"],
     CONF_TOTAL_SHORT_FORECAST: ["PJM 2HR Forecast", "MW"],
     CONF_ZONAL_LMP: ["Hourly Average Zonal LMP", '$/MWh'],
