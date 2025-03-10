@@ -180,10 +180,17 @@ class PJMSensor(SensorEntity):
         attr = {}
         if self._identifier and self._type not in [CONF_TOTAL_LOAD_FORECAST, CONF_TOTAL_SHORT_FORECAST]:
             attr["identifier"] = self._identifier
+            
+        if self._type in [CONF_INSTANTANEOUS_ZONE_LOAD, CONF_INSTANTANEOUS_TOTAL_LOAD]:
+            attr["observed_rate_of_change"] = self._observed_roc
 
-        if self._type in [CONF_TOTAL_LOAD_FORECAST, CONF_ZONE_LOAD_FORECAST, CONF_TOTAL_SHORT_FORECAST, CONF_ZONE_SHORT_FORECAST]:
+        if self._type in [CONF_TOTAL_LOAD_FORECAST, CONF_ZONE_LOAD_FORECAST]:
             attr["forecast_hour_ending"] = self._forecast_hour_ending.isoformat() if hasattr(self, "_forecast_hour_ending") and self._forecast_hour_ending else None
-            #attr["forecast_data"] = self._forecast_data
+
+        if self._type in [CONF_TOTAL_SHORT_FORECAST, CONF_ZONE_SHORT_FORECAST]:
+            attr["forecast_hour_ending"] = self._forecast_hour_ending.isoformat() if hasattr(self, "_forecast_hour_ending") and self._forecast_hour_ending else None
+            attr["forecast_rate_of_change"] = self._forecast_roc
+            # attr["forecast_data"] = self._forecast_data
         return attr
 
     async def async_update(self):
@@ -205,30 +212,84 @@ class PJMSensor(SensorEntity):
         if load is not None:
             self._state = load
 
+        # 2) Append to a rolling history
+        now_utc = datetime.now(timezone.utc)
+        if not hasattr(self, "_load_history"):
+            self._load_history = deque(maxlen=12)  # ~ 1 hour if each update is 5 min
+        self._load_history.append((now_utc, load))
+
+        # 3) Compute derivative over this 1-hour window
+        self._observed_roc = self._compute_instantaneous_roc()
+
     @Throttle(MIN_TIME_BETWEEN_UPDATES_FORECAST)
     async def update_forecast(self):
         forecast_data = await self._pjm_data.async_update_forecast(self._identifier)
         if forecast_data is not None:
             max_forecast = max(forecast_data, key=lambda x: x["forecast_load_mw"])
             peak_forecast_load = max_forecast["forecast_load_mw"]
-            #peak_forecast_load = max(forecast_data, key=lambda x: x["forecast_load_mw"])["forecast_load_mw"]
             self._state = peak_forecast_load
             self._forecast_hour_ending = max_forecast["forecast_hour_ending"]
-            #self._forecast_data = forecast_data
+
 
     @Throttle(MIN_TIME_BETWEEN_UPDATES_INSTANTANEOUS)
     async def update_short_forecast(self):
-        load, forecast_hour_ending = await self._pjm_data.async_update_short_forecast(self._identifier)
-        if load is not None:
-            self._state = load
-        if forecast_hour_ending is not None:
-            self._forecast_hour_ending = forecast_hour_ending
+        forecast_data = await self._pjm_data.async_update_short_forecast(self._identifier)
+        if forecast_data and len(forecast_data) > 1:
+            #self._forecast_data = forecast_data
+            # 1) Compute the maximum forecast load & set state
+            max_item = max(forecast_data, key=lambda x: x["forecast_load_mw"])
+            self._state = max_item["forecast_load_mw"]
+            self._forecast_hour_ending = max_item["forecast_hour_ending"]
+            # 2) Compute the derivative (MW/hr) for the chosen window
+            self._forecast_roc = self._compute_forecast_rate_of_change(forecast_data)
+        else:
+            # No valid data
+            #self._forecast_data = None
+            self._forecast_roc = 0
 
     @Throttle(MIN_TIME_BETWEEN_UPDATES_INSTANTANEOUS)
     async def update_lmp(self):
         lmp = await self._pjm_data.async_update_lmp(self._identifier)
         if lmp is not None:
             self._state = lmp
+
+    def _compute_instantaneous_roc(self):
+        """Compute MW/hr slope from the oldest to newest in _load_history."""
+        if not hasattr(self, "_load_history") or len(self._load_history) < 2:
+            return 0
+        oldest_time, oldest_val = self._load_history[0]
+        newest_time, newest_val = self._load_history[-1]
+        delta_load = newest_val - oldest_val
+        delta_time = (newest_time - oldest_time).total_seconds() / 3600
+        if delta_time <= 0:
+            return 0
+        return delta_load / delta_time
+
+    def _compute_forecast_rate_of_change(self, data):
+        """
+        Example approach:
+        - We'll calculate a slope over the next 30 minutes from data[0] to data that ends by +30min
+        - Could also do entire 2 hours, or up to the peak, etc.
+        """
+        if not data or len(data) < 2:
+            return 0
+
+        # Filter data for next 30 minutes from the first forecast
+        start_time = data[0]["forecast_hour_ending"]
+        window_end_time = start_time + timedelta(minutes=30)
+        segment = [x for x in data if x["forecast_hour_ending"] <= window_end_time]
+        if len(segment) < 2:
+            # fallback: just use entire 2-hour window
+            segment = data
+
+        start = segment[0]
+        end = segment[-1]
+        delta_load = end["forecast_load_mw"] - start["forecast_load_mw"]
+        delta_time_hrs = (end["forecast_hour_ending"] - start["forecast_hour_ending"]).total_seconds() / 3600
+        if delta_time_hrs <= 0:
+            return 0
+
+        return delta_load / delta_time_hrs
 
 class CoincidentPeakPredictionSensor(SensorEntity):
     """
@@ -261,6 +322,11 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         self._attr_unique_id = f"pjm_{sensor_type}_{zone}"
         self._unit_of_measurement = "MW"
         self._state = None
+
+        # --- Track last API update
+        self._last_load_update = None
+        self._last_forecast_update = None
+        self._last_short_forecast_update = None
 
         # --- Configurable thresholds
         self._user_defined_threshold = peak_threshold
@@ -330,13 +396,14 @@ class CoincidentPeakPredictionSensor(SensorEntity):
           5) Track performance.
         """
         now_local = datetime.now(timezone.utc).astimezone()
+        load = self._state
 
         # 1. Get latest instantaneous load.
-        load = await self._pjm_data.async_update_instantaneous(self._zone)
-        if load is None:
-            _LOGGER.error("No load data returned for %s", self._zone)
-            return
-        self._append_load_history(load)
+        if self._last_load_update is None or (now_local - self._last_load_update) >= timedelta(minutes=5):
+            load = await self._pjm_data.async_update_instantaneous(self._zone)
+            if load is not None:
+                self._append_load_history(load)
+                self._last_load_update = now_local  # Update last load fetch timestamp
 
         # 2. Each Hour perform a 5CP check. 
         if (
@@ -352,26 +419,51 @@ class CoincidentPeakPredictionSensor(SensorEntity):
 
         # 4. If the day was flagged high risk, refine predictions intraday:
         if self._high_risk_day:
-            # Retrieve short forecast for next 2 hours:
-            short_load, short_time = await self._pjm_data.async_update_short_forecast(self._zone)
-            # If short forecast not available, fallback to the 7-day forecast. 
-            if short_load is None:
-                # Force an update to 7-day if not fetched in last hour:
-                if now_local.minute < 5:
-                    seven_day_data = await self._pjm_data.async_update_forecast(self._zone)
-                    if seven_day_data:
-                        self._update_forecasted_daily_peaks(seven_day_data)
-                short_load = self._forecasted_daily_peaks.get(now_local.date(), load)
-                short_time = now_local.timestamp()
+            now_local = datetime.now(timezone.utc).astimezone()
 
-            # --- Now compute peak hour + load for the day. 
-            #     If we are near the forecasted peak hour, do advanced checks.
-            predicted_peak_load, predicted_peak_time = self._refine_peak_prediction(now_local, load, short_load)
-            self._state = predicted_peak_load
-            self._predicted_peak_time = predicted_peak_time
-            self._forecasted_peak_today = bool(predicted_peak_load and predicted_peak_load >= self._get_fifth_highest_peak())
+            # Refresh short forecast only within 3 hours of the daily forecast peak hour
+            forecast_peak_hour = self._forecasted_daily_peak_time.get(now_local.date())
+            if forecast_peak_hour and abs((forecast_peak_hour - now_local).total_seconds()) <= 3 * 3600:
+                if (self._last_short_forecast_update is None or 
+                    (now_local - self._last_short_forecast_update) >= timedelta(minutes=5)):
+                    short_forecast_data = await self._pjm_data.async_update_short_forecast(self._zone)
+                    if short_forecast_data:
+                        max_short_forecast = max(short_forecast_data, key=lambda x: x["forecast_load_mw"])
+                        short_load = max_short_forecast["forecast_load_mw"]
+                        short_time = max_short_forecast["forecast_hour_ending"]
+                        self._last_short_forecast_update = now_local
+                    else:
+                        short_load = None
+                        short_time = None
+
+                # Fallback to daily forecast if short forecast unavailable
+                if short_load is None:
+                    short_load = self._forecasted_daily_peaks.get(now_local.date(), load)
+                    short_time = forecast_peak_hour
+
+                # Calculate forecasted rate of change (first derivative)
+                forecasted_rate = self._calculate_forecasted_rate_of_change(short_forecast_data)
+
+                # Calculate instantaneous load rate of change
+                instantaneous_rate = self._calculate_instantaneous_rate_of_change()
+
+                # Determine if actual peak is arriving sooner/later
+                time_adjustment = self._predict_time_shift(instantaneous_rate, forecasted_rate)
+
+                # Adjust predicted peak time based on rate comparison
+                refined_peak_time = short_time + timedelta(minutes=time_adjustment)
+
+                # Update predictions
+                self._state = short_load
+                self._predicted_peak_time = refined_peak_time
+                self._forecasted_peak_today = self._state >= self._get_fifth_highest_peak()
+            else:
+                # Too early or late for refinement; just use daily forecast
+                self._state = self._forecasted_daily_peaks.get(now_local.date(), load)
+                self._predicted_peak_time = forecast_peak_hour
+                self._forecasted_peak_today = self._state >= self._get_fifth_highest_peak()
         else:
-            # If not high risk, just set state to current load or do a simple daily forecast update.
+            # Not high-risk; default to instantaneous load
             self._state = load
             self._predicted_peak_time = None
             self._forecasted_peak_today = False
@@ -459,6 +551,34 @@ class CoincidentPeakPredictionSensor(SensorEntity):
             # ... or do a quadratic approach if desired ...
 
         return (int(round(peak_load)), peak_time)
+
+    def _calculate_forecasted_rate_of_change(self, short_forecast_data):
+        """Calculate rate of change (MW/hr) from short forecast."""
+        if not short_forecast_data or len(short_forecast_data) < 2:
+            return 0
+        loads = [x["forecast_load_mw"] for x in short_forecast_data[:2]]
+        times = [x["forecast_hour_ending"].timestamp() for x in short_forecast_data[:2]]
+        delta_load = loads[1] - loads[0]
+        delta_time = (times[1] - times[0]) / 3600  # hours
+        return delta_load / delta_time if delta_time else 0
+
+    def _calculate_instantaneous_rate_of_change(self):
+        """Calculate instantaneous load rate from history (last hour)."""
+        if len(self._load_history) < 2:
+            return 0
+        latest, oldest = self._load_history[-1], self._load_history[0]
+        delta_load = latest[1] - oldest[1]
+        delta_time = (latest[0] - oldest[0]).total_seconds() / 3600  # hours
+        return delta_load / delta_time if delta_time else 0
+
+    def _predict_time_shift(self, instantaneous_rate, forecasted_rate):
+        """Predict shift in peak timing based on rate comparison."""
+        rate_difference = instantaneous_rate - forecasted_rate
+        if abs(rate_difference) < 100:  # Arbitrary threshold MW/hr
+            return 0  # minimal shift
+        # positive rate_difference means peak arriving sooner
+        time_shift_minutes = -10 if rate_difference > 0 else 10
+        return time_shift_minutes
 
     def _check_if_peak_hour_active(self, now_local):
         """
@@ -701,23 +821,16 @@ class PJMData:
                 response = await self._websession.get(resource, headers=headers)
                 full_data = await response.json()
                 data = full_data["items"]
-                sorted_data = sorted(
-                    data, 
-                    key=lambda x: (
-                        x["forecast_load_mw"] * -1, 
-                        datetime.strptime(x['forecast_datetime_ending_utc'],'%Y-%m-%dT%H:%M:%S')
-                        .replace(tzinfo=timezone.utc).astimezone()
-                    )
-                )
-                if sorted_data:
-                    load = int(sorted_data[0]["forecast_load_mw"])
-                    forecast_hour_ending = datetime.strptime(
-                        sorted_data[0]['forecast_datetime_ending_utc'],
-                        '%Y-%m-%dT%H:%M:%S'
-                    ).astimezone()
-                    #unix_time = forecast_hour_ending.timestamp()
-                    return (load, forecast_hour_ending)
-                return (None, None)
+                
+                forecast_data = []
+                for item in data:
+                    forecast_hour_ending = datetime.strptime(item['forecast_datetime_ending_utc'], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc).astimezone()
+                    forecast_data.append({
+                        "forecast_hour_ending": forecast_hour_ending,
+                        "forecast_load_mw": int(item["forecast_load_mw"])
+                    })
+                return forecast_data
+                
         except (asyncio.TimeoutError, aiohttp.ClientError) as err:
             _LOGGER.error("Could not get short forecast data from PJM: %s", err)
             return (None, None)
