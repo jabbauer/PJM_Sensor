@@ -188,7 +188,7 @@ class PJMSensor(SensorEntity):
             attr["forecast_hour_ending"] = self._forecast_hour_ending.isoformat() if hasattr(self, "_forecast_hour_ending") and self._forecast_hour_ending else None
 
         if self._type in [CONF_TOTAL_SHORT_FORECAST, CONF_ZONE_SHORT_FORECAST]:
-            attr["forecast_hour_ending"] = self._forecast_hour_ending.isoformat() if hasattr(self, "_forecast_hour_ending") and self._forecast_hour_ending else None
+            attr["forecast_peak_time"] = self._forecast_hour_ending.isoformat() if hasattr(self, "_forecast_hour_ending") and self._forecast_hour_ending else None
             attr["forecast_rate_of_change"] = self._forecast_roc
             # attr["forecast_data"] = self._forecast_data
         return attr
