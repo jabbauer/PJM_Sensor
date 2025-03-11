@@ -345,6 +345,7 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         # --- Additional attributes for daily CP warnings
         self._forecasted_peak_today = False
         self._peak_hour_active = False
+        self._predicted_peak = None
         self._predicted_peak_time = None
         self._refined_forecast = None
 
@@ -376,7 +377,7 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         Returns a dict with additional debug / tracking fields.
         """
         return {
-            "predicted_peak": self._state,
+            "predicted_peak": self._predicted_peak,
             "predicted_peak_time": self._predicted_peak_time.isoformat() if self._predicted_peak_time else None,
             "forecasted_peak_today": self._forecasted_peak_today,
             "peak_hour_active": self._peak_hour_active,
@@ -389,11 +390,7 @@ class CoincidentPeakPredictionSensor(SensorEntity):
     async def async_update(self):
         """
         Main update flow. 
-          1) Fetch real-time load + short-term forecast,
-          2) Possibly do the daily 03:00 CP check,
-          3) If high risk, refine intraday peak predictions,
-          4) Update the state & flags accordingly,
-          5) Track performance.
+
         """
         now_local = datetime.now(timezone.utc).astimezone()
         load = self._state
@@ -419,44 +416,34 @@ class CoincidentPeakPredictionSensor(SensorEntity):
 
         # 4. If the day was flagged high risk, refine predictions intraday:
         if self._high_risk_day:
-            now_local = datetime.now(timezone.utc).astimezone()
-
             # Refresh short forecast only within 3 hours of the daily forecast peak hour
-            forecast_peak_hour = self._forecasted_daily_peak_time.get(now_local.date())
+            forecast_peak_hour = self._predicted_peak_time
+            
             if forecast_peak_hour and abs((forecast_peak_hour - now_local).total_seconds()) <= 3 * 3600:
+                # Attempt to refine with short forecast
                 if (self._last_short_forecast_update is None or 
                     (now_local - self._last_short_forecast_update) >= timedelta(minutes=5)):
-                    short_forecast_data = await self._pjm_data.async_update_short_forecast(self._zone)
+
+                    forecast_zone = "RTO_COMBINED" if self._zone.upper() == "PJM RTO" else self._zone
+                    short_forecast_data = await self._pjm_data.async_update_short_forecast(forecast_zone)
+                    self._last_short_forecast_update = now_local
+
                     if short_forecast_data:
                         max_short_forecast = max(short_forecast_data, key=lambda x: x["forecast_load_mw"])
                         short_load = max_short_forecast["forecast_load_mw"]
-                        short_time = max_short_forecast["forecast_hour_ending"]
-                        self._last_short_forecast_update = now_local
                     else:
                         short_load = None
-                        short_time = None
 
-                # Fallback to daily forecast if short forecast unavailable
-                if short_load is None:
-                    short_load = self._forecasted_daily_peaks.get(now_local.date(), load)
-                    short_time = forecast_peak_hour
+                # If short_load is None, fallback to daily peak load in self._state
+                short_load = short_load if short_load is not None else self._predicted_peak
 
-                # Calculate forecasted rate of change (first derivative)
-                forecasted_rate = self._calculate_forecasted_rate_of_change(short_forecast_data)
+                # Now refine peak load/time with the short forecast
+                predicted_peak_load, predicted_peak_time = self._refine_peak_prediction(now_local, self._state, short_load)
+                self._predicted_peak = predicted_peak_load
+                self._predicted_peak_time = predicted_peak_time
 
-                # Calculate instantaneous load rate of change
-                instantaneous_rate = self._calculate_instantaneous_rate_of_change()
-
-                # Determine if actual peak is arriving sooner/later
-                time_adjustment = self._predict_time_shift(instantaneous_rate, forecasted_rate)
-
-                # Adjust predicted peak time based on rate comparison
-                refined_peak_time = short_time + timedelta(minutes=time_adjustment)
-
-                # Update predictions
-                self._state = short_load
-                self._predicted_peak_time = refined_peak_time
-                self._forecasted_peak_today = self._state >= self._get_fifth_highest_peak()
+                # Evaluate if we’re still above the 5th highest known peak
+                self._forecasted_peak_today = predicted_peak_load >= self._get_fifth_highest_peak()
             else:
                 # Too early or late for refinement; just use daily forecast
                 self._state = self._forecasted_daily_peaks.get(now_local.date(), load)
@@ -484,9 +471,10 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         If yes, set high_risk_day = True, so we do more detailed intraday tracking.
         """
         # Pull the 1-day forecast for the zone:
-        forecast_data = await self._pjm_data.async_update_forecast(self._zone)
+        forecast_zone = "RTO_COMBINED" if self._zone.upper() == "PJM RTO" else self._zone
+        forecast_data = await self._pjm_data.async_update_forecast(forecast_zone)
         if not forecast_data:
-            _LOGGER.warning("No 7-day forecast available during 08:00 check for %s", self._zone)
+            _LOGGER.warning("No 7-day forecast available for %s", self._zone)
             return
 
         # Pick the forecast with the maximum load
@@ -505,6 +493,10 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         else:
             self._high_risk_day = False
             _LOGGER.info("Not a likely CP day for %s (forecast=%.1f, threshold=%.1f)", peak_forecast_load, fifth_peak)
+
+            # Whether it’s high risk or not, store an initial predicted peak from the daily forecast
+        self._predicted_peak = peak_forecast_load
+        self._predicted_peak_time = peak_forecast_time
 
     def _refine_peak_prediction(self, now_local, current_load, short_forecast_load):
         """
