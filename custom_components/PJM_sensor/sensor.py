@@ -27,6 +27,7 @@ from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import Throttle
+from homeassistant.util import dt as dt_util
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import (
@@ -293,24 +294,12 @@ class PJMSensor(SensorEntity):
 
 class CoincidentPeakPredictionSensor(SensorEntity):
     """
-    Enhanced sensor to predict PJM (or zone) coincident peaks using a multi-stage approach:
-
-      1. Daily 5CP Likelihood by 03:00
-         - Compare today's 7-day forecast peak to the current 5th highest system peak.
-         - If forecast is near or above that threshold, mark a 'high CP risk' day.
-      
-      2. Intraday Hour-Ahead Prediction
-         - Continuously refine the exact peak hour using:
-             • Five-Minute Load Forecast (short forecast),
-             • Instantaneous Load,
-             • Real-time temperature (optional, if exposed in the API),
-             • Observed forecast errors.
-         - Provide at least 1 hour lead time if possible.
-      
-      3. Self-Improving Over Time
-         - Each day, track whether a peak event was correctly identified.
-         - Update top 5 peaks list and compare day’s actual peak with forecasted.
-         - Adjust daily threshold or forecast bias if consistent over/underpredictions are observed.
+    Reworked Coincident Peak Prediction sensor that:
+      - Always exposes the current instantaneous load as its state.
+      - Tracks rolling load data to compute observed rate-of-change (ROC) and acceleration (ACC).
+      - Uses a kinematic (quadratic) model to predict the daily peak time and load.
+      - Switches between daily and short forecasts based on how close we are to the predicted peak.
+      - Flags high-risk days based on 5CP logic.
     """
 
     def __init__(self, pjm_data, zone, peak_threshold, accuracy_threshold, sensor_type):
@@ -321,40 +310,41 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         self._attr_name = f"Coincident Peak Prediction ({zone})"
         self._attr_unique_id = f"pjm_{sensor_type}_{zone}"
         self._unit_of_measurement = "MW"
+        
+        # The main sensor state is the current instantaneous load.
         self._state = None
-
-        # --- Track last API update
-        self._last_load_update = None
-        self._last_forecast_update = None
+        
+        # Rolling load history (timestamp, load) for derivative calculations (~1-2 hours)
+        self._load_history = deque(maxlen=12)
+        
+        # Forecast update trackers
+        self._last_daily_forecast_update = None
         self._last_short_forecast_update = None
-
-        # --- Configurable thresholds
-        self._user_defined_threshold = peak_threshold
-        self._accuracy_threshold = accuracy_threshold
-
-        # --- Data Structures
-        self._load_history = deque(maxlen=MAX_HISTORY_SIZE) 
-        self._daily_forecast = []
-        self._actual_daily_peaks = {}         
-        self._forecasted_daily_peaks = {}     
-        self._forecasted_daily_peak_time = {} 
-        self._top_five_peaks = []
-        self._short_forecast_history = []
-        self._historical_peak_accuracy = []
-
-        # --- Additional attributes for daily CP warnings
-        self._forecasted_peak_today = False
-        self._peak_hour_active = False
+        
+        # Predicted peak (from daily and short forecast refinements)
         self._predicted_peak = None
         self._predicted_peak_time = None
-        self._refined_forecast = None
 
-        # --- New: Track days flagged as potential CP (so we can refine intraday)
+        # Observed derivatives from load history
+        self._observed_roc = 0.0   # MW/hr
+        self._observed_acc = 0.0   # MW/hr²
+
+        # Forecasted derivatives (from short forecast data, if available)
+        self._forecasted_roc = 0.0
+        self._forecasted_acc = 0.0
+        
+        # Bias factors to improve prediction over time
+        self._roc_bias = 0.0
+        self._acc_bias = 0.0
+
+        # Flags and thresholds
+        self._daily_peak_occurred = False
+        self._top_five_peaks = []
+        self._peak_threshold = peak_threshold
         self._high_risk_day = False
-        self._morning_prediction_time = None
-
-        # For storing typical forecast bias or error metrics (to self-improve).
-        self._rolling_forecast_errors = deque(maxlen=30)  # store last 30 day-peak errors
+        self._peak_hour_active = False
+        self._error_history = deque(maxlen=30)
+        self._accuracy_threshold = accuracy_threshold
 
     @property
     def icon(self):
@@ -366,315 +356,267 @@ class CoincidentPeakPredictionSensor(SensorEntity):
 
     @property
     def native_value(self):
-        """
-        For immediate reference: the predicted peak load (MW).
-        """
+        """Return the instantaneous load (MW) as the sensor state."""
         return self._state
 
     @property
     def extra_state_attributes(self):
-        """
-        Returns a dict with additional debug / tracking fields.
-        """
+        """Return additional predictive and diagnostic attributes."""
         return {
+            "observed_roc": self._observed_roc,
+            "observed_acc": self._observed_acc,
+            "forecasted_roc": self._forecasted_roc,
+            "forecasted_acc": self._forecasted_acc,
             "predicted_peak": self._predicted_peak,
-            "predicted_peak_time": self._predicted_peak_time.isoformat() if self._predicted_peak_time else None,
-            "forecasted_peak_today": self._forecasted_peak_today,
-            "peak_hour_active": self._peak_hour_active,
+            "predicted_peak_time": (
+                self._predicted_peak_time.isoformat() 
+                if self._predicted_peak_time else None
+            ),
             "high_risk_day": self._high_risk_day,
+            "peak_hour_active": self._peak_hour_active,
             "top_five_peaks": self._top_five_peaks,
-            "recent_forecast_errors": list(self._rolling_forecast_errors),
-            "accuracy_probability_percent": self._compute_accuracy_probability(),
+            "bias_roc": self._roc_bias,
+            "bias_acc": self._acc_bias,
+            "error_history": list(self._error_history),
         }
 
     async def async_update(self):
         """
-        Main update flow. 
-
+        Main update flow executed on each sensor poll (e.g., every 5 minutes):
+          1. Update instantaneous load and rolling history.
+          2. Compute observed derivatives.
+          3. If the daily peak hasn't occurred, update forecasts and refine predictions.
+          4. Evaluate high-risk day and peak hour active status.
+          5. After the predicted peak time, record forecast error and adjust bias.
         """
-        now_local = datetime.now(timezone.utc).astimezone()
-        load = self._state
+        now = dt_util.now()  # using Home Assistant's dt_util for timezone-aware times
+        
+        # 1. Update instantaneous load and record history.
+        await self._update_instantaneous_load()
+        
+        # 2. Compute observed ROC and acceleration from load history.
+        self._compute_observed_derivatives()
+        
+        # 3. Refine predictions if the daily peak has not occurred.
+        if not self._daily_peak_occurred:
+            await self._maybe_update_forecasts(now)
+            self._predict_peak_using_kinematics(now)
+        
+        # 4. Evaluate high-risk day and peak hour active status.
+        self._evaluate_5cp_risk()
+        self._check_peak_hour_active(now)
+        
+        # 5. Once the predicted peak is past, record forecast error.
+        if (self._predicted_peak_time and 
+            now >= self._predicted_peak_time + timedelta(minutes=15) and 
+            not self._daily_peak_occurred):
+            self._daily_peak_occurred = True
+            self._record_error_and_update_bias()
+            _LOGGER.info("Peak hour passed; suspending forecast updates until next day.")
 
-        # 1. Get latest instantaneous load.
-        if self._last_load_update is None or (now_local - self._last_load_update) >= timedelta(minutes=5):
-            load = await self._pjm_data.async_update_instantaneous(self._zone)
-            if load is not None:
-                self._append_load_history(load)
-                self._last_load_update = now_local  # Update last load fetch timestamp
+    async def _update_instantaneous_load(self):
+        """Fetch the current load from PJMData and update state and load history."""
+        try:
+            load_val = await self._pjm_data.async_update_instantaneous(self._zone)
+            if load_val is not None:
+                self._state = load_val
+                self._load_history.append((dt_util.now(), load_val))
+        except Exception as err:
+            _LOGGER.error("Error updating instantaneous load: %s", err)
 
-        # 2. Each Hour perform a 5CP check. 
-        if (
-            self._morning_prediction_time is None or 
-            self._morning_prediction_time.date() < now_local.date() or 
-            (now_local - self._morning_prediction_time) >= timedelta(hours=1)
-        ):
-            self._morning_prediction_time = now_local
-            await self._daily_5cp_check(now_local)
-
-        # 3. Update actual daily peaks from the load history.
-        self._update_actual_daily_peaks(now_local)
-
-        # 4. If the day was flagged high risk, refine predictions intraday:
-        if self._high_risk_day:
-            # Refresh short forecast only within 3 hours of the daily forecast peak hour
-            forecast_peak_hour = self._predicted_peak_time
-            
-            if forecast_peak_hour and abs((forecast_peak_hour - now_local).total_seconds()) <= 3 * 3600:
-                # Attempt to refine with short forecast
-                if (self._last_short_forecast_update is None or 
-                    (now_local - self._last_short_forecast_update) >= timedelta(minutes=5)):
-
-                    forecast_zone = "RTO_COMBINED" if self._zone.upper() == "PJM RTO" else self._zone
-                    short_forecast_data = await self._pjm_data.async_update_short_forecast(forecast_zone)
-                    self._last_short_forecast_update = now_local
-
-                    if short_forecast_data:
-                        max_short_forecast = max(short_forecast_data, key=lambda x: x["forecast_load_mw"])
-                        short_load = max_short_forecast["forecast_load_mw"]
-                    else:
-                        short_load = None
-
-                # If short_load is None, fallback to daily peak load in self._state
-                short_load = short_load if short_load is not None else self._predicted_peak
-
-                # Now refine peak load/time with the short forecast
-                predicted_peak_load, predicted_peak_time = self._refine_peak_prediction(now_local, self._state, short_load)
-                self._predicted_peak = predicted_peak_load
-                self._predicted_peak_time = predicted_peak_time
-
-                # Evaluate if we’re still above the 5th highest known peak
-                self._forecasted_peak_today = predicted_peak_load >= self._get_fifth_highest_peak()
-            else:
-                # Too early or late for refinement; just use daily forecast
-                self._state = self._forecasted_daily_peaks.get(now_local.date(), load)
-                self._predicted_peak_time = forecast_peak_hour
-                self._forecasted_peak_today = self._state >= self._get_fifth_highest_peak()
-        else:
-            # Not high-risk; default to instantaneous load
-            self._state = load
-            self._predicted_peak_time = None
-            self._forecasted_peak_today = False
-
-        # 5. Check if we are currently in the predicted peak hour:
-        self._peak_hour_active = self._check_if_peak_hour_active(now_local)
-
-        # 6. Update top five peaks.
-        self._update_top_five_peaks()
-
-        # 7. Log accuracy if near the end of the day or top-of-hour.
-        if now_local.minute < 3:
-            self._record_forecast_error(load)
-
-    async def _daily_5cp_check(self, now_local):
+    def _compute_observed_derivatives(self):
         """
-        Do the morning check to see if today's forecast might exceed the current 5th highest peak.
-        If yes, set high_risk_day = True, so we do more detailed intraday tracking.
+        Use the last hour of load history to fit a quadratic and extract:
+          - First derivative (observed_roc in MW/hr)
+          - Second derivative (observed_acc in MW/hr²)
         """
-        # Pull the 1-day forecast for the zone:
-        forecast_zone = "RTO_COMBINED" if self._zone.upper() == "PJM RTO" else self._zone
-        forecast_data = await self._pjm_data.async_update_forecast(forecast_zone)
-        if not forecast_data:
-            _LOGGER.warning("No 7-day forecast available for %s", self._zone)
+        if len(self._load_history) < 3:
+            self._observed_roc = 0.0
+            self._observed_acc = 0.0
             return
 
-        # Pick the forecast with the maximum load
-        max_forecast = max(forecast_data, key=lambda x: x["forecast_load_mw"])
-        peak_forecast_load = max_forecast["forecast_load_mw"]
-        peak_forecast_time = max_forecast["forecast_hour_ending"]
+        times, loads = self._extract_time_load_arrays(self._load_history, limit_hours=1.0)
+        if len(times) < 3:
+            self._observed_roc = 0.0
+            self._observed_acc = 0.0
+            return
 
-        # Store the forecast data (for debugging / attribute use) similar to update_forecast.
-        self._forecast_data = forecast_data
+        coeffs = np.polyfit(times, loads, 2)  # quadratic fit: a*x² + b*x + c
+        t_last = times[-1]
+        self._observed_roc = (2 * coeffs[0] * t_last + coeffs[1])
+        self._observed_acc = 2 * coeffs[0]
 
-        # Compare to the 5th highest known peak:
-        fifth_peak = self._get_fifth_highest_peak()
-        if peak_forecast_load >= 0.95 * fifth_peak:  # if it's close to or above the threshold
-            self._high_risk_day = True
-            _LOGGER.info("Flagging %s as high risk for new 5CP (forecast=%.1f, threshold=%.1f)", peak_forecast_load, fifth_peak)
-        else:
+    async def _maybe_update_forecasts(self, now):
+        """
+        Decide whether to pull a daily forecast (if peak is far away) or a short forecast (within 3 hours).
+        """
+        time_to_peak = None
+        if self._predicted_peak_time:
+            time_to_peak = self._predicted_peak_time - now
+
+        if (time_to_peak is None or time_to_peak > timedelta(hours=3)) and (
+            not self._last_daily_forecast_update or (now - self._last_daily_forecast_update) >= timedelta(hours=1)
+        ):
+            await self._update_daily_forecast()
+            self._last_daily_forecast_update = now
+
+        elif (time_to_peak is not None and time_to_peak <= timedelta(hours=3) and 
+            not self._daily_peak_occurred):
+            if (not self._last_short_forecast_update or 
+                (now - self._last_short_forecast_update) >= timedelta(minutes=5)):
+                await self._update_short_forecast()
+                self._last_short_forecast_update = now
+
+    async def _update_daily_forecast(self):
+        """Pull daily forecast data and update predicted peak and time for today."""
+        try:
+            forecast_zone = "RTO_COMBINED" if self._zone.upper() == "PJM RTO" else self._zone
+            data = await self._pjm_data.async_update_forecast(forecast_zone)
+            if data:
+                today = dt_util.now().date()
+                day_data = [x for x in data if x["forecast_hour_ending"].date() == today]
+                if day_data:
+                    max_item = max(day_data, key=lambda x: x["forecast_load_mw"])
+                    self._predicted_peak = max_item["forecast_load_mw"]
+                    self._predicted_peak_time = max_item["forecast_hour_ending"]
+                    _LOGGER.debug("Daily forecast: peak=%.1f at %s", self._predicted_peak, self._predicted_peak_time)
+        except Exception as err:
+            _LOGGER.error("Error updating daily forecast: %s", err)
+
+    async def _update_short_forecast(self):
+        """
+        Pull short forecast data to compute forecasted derivatives (if available) and update
+        the predicted peak if the short forecast shows a peak inside the 2-hour window.
+        """
+        try:
+            forecast_zone = "RTO_COMBINED" if self._zone.upper() == "PJM RTO" else self._zone
+            data = await self._pjm_data.async_update_short_forecast(forecast_zone)
+            if data and len(data) > 1:
+                times, loads = self._extract_time_load_arrays_short(data, limit_minutes=60)
+                if len(times) >= 3:
+                    coeffs = np.polyfit(times, loads, 2)
+                    t_last = times[-1]
+                    self._forecasted_roc = 2 * coeffs[0] * t_last + coeffs[1]
+                    self._forecasted_acc = 2 * coeffs[0]
+                max_item = max(data, key=lambda x: x["forecast_load_mw"])
+                if max_item != data[-1]:
+                    self._predicted_peak = max_item["forecast_load_mw"]
+                    self._predicted_peak_time = max_item["forecast_hour_ending"]
+                    _LOGGER.debug("Short forecast: peak=%.1f at %s", self._predicted_peak, self._predicted_peak_time)
+        except Exception as err:
+            _LOGGER.error("Error updating short forecast: %s", err)
+            self._forecasted_roc = 0.0
+            self._forecasted_acc = 0.0
+
+    def _predict_peak_using_kinematics(self, now):
+        """
+        Use the current load, observed ROC and ACC (optionally blended with forecasted values
+        and bias adjustments) to predict the peak time and load.
+        
+        Using:
+          t = -avg_roc / avg_acc  (when avg_acc is negative as we approach a peak)
+          P_peak = current_load + avg_roc*t + 0.5*avg_acc*t^2
+        """
+        # Blend observed and forecasted values if available:
+        # Here, we apply a simple average with bias adjustments.
+        blended_roc = 0.5 * (self._observed_roc + self._forecasted_roc) + self._roc_bias
+        blended_acc = 0.5 * (self._observed_acc + self._forecasted_acc) + self._acc_bias
+
+        # When approaching the peak, ROC is positive but decelerating (i.e. blended_acc is negative)
+        if blended_acc == 0:
+            return  # Insufficient trend information
+        
+        # Calculate time until peak: t = - (blended_roc) / (blended_acc)
+        # (Note: blended_acc should be negative; t > 0 if the peak is ahead.)
+        t_peak = -blended_roc / blended_acc
+        
+        if t_peak <= 0:
+            # If t_peak is negative or zero, it indicates the peak is already reached.
+            return
+
+        # Predicted peak load using the quadratic model:
+        predicted_load = self._state + blended_roc * t_peak + 0.5 * blended_acc * (t_peak ** 2)
+        
+        # Update predicted peak attributes:
+        self._predicted_peak = int(round(predicted_load))
+        self._predicted_peak_time = now + timedelta(hours=t_peak)
+        _LOGGER.debug("Kinematic prediction: t=%.2f hrs, peak load=%.0f MW at %s", t_peak, predicted_load, self._predicted_peak_time)
+
+    def _evaluate_5cp_risk(self):
+        """Flag high-risk day if predicted peak is near or exceeds the 5th highest historical peak."""
+        if not self._predicted_peak:
             self._high_risk_day = False
-            _LOGGER.info("Not a likely CP day for %s (forecast=%.1f, threshold=%.1f)", peak_forecast_load, fifth_peak)
+            return
+        fifth_peak = self._get_fifth_highest_peak()
+        self._high_risk_day = self._predicted_peak >= 0.95 * fifth_peak
 
-            # Whether it’s high risk or not, store an initial predicted peak from the daily forecast
-        self._predicted_peak = peak_forecast_load
-        self._predicted_peak_time = peak_forecast_time
-
-    def _refine_peak_prediction(self, now_local, current_load, short_forecast_load):
+    def _check_peak_hour_active(self, now):
         """
-        Decide which hour is likely to be today's peak:
-         1) Check official daily forecast peak hour
-         2) Compare real-time load trends vs. forecast
-         3) Possibly do rate-of-change or short regression to find if 
-            the peak might shift from the official forecast hour 
-         Returns (peak_load, peak_time).
+        Set peak_hour_active True if the current time falls within the hour of the predicted peak,
+        and if the day is flagged as high-risk.
         """
-        # Basic approach: we expect the top load to occur late afternoon. 
-        # Let's see if the short_forecast_load is higher than the 7-day forecasted peak for today.
+        if not self._high_risk_day or not self._predicted_peak_time:
+            self._peak_hour_active = False
+            return
+        pstart = self._predicted_peak_time.replace(minute=0, second=0, microsecond=0)
+        pend = pstart + timedelta(hours=1)
+        self._peak_hour_active = (pstart <= now < pend)
 
-        today = now_local.date()
-        daily_forecast_peak = self._forecasted_daily_peaks.get(today, 0)
-        # A simple bias correction:
-        # If we consistently see a bias (rolling avg error), correct the daily peak forecast:
-        avg_error = np.mean(self._rolling_forecast_errors) if self._rolling_forecast_errors else 0
-        corrected_daily_peak = daily_forecast_peak + avg_error
-
-        # Compare short vs corrected daily peak:
-        if short_forecast_load is not None and short_forecast_load > corrected_daily_peak * 0.9:
-            # If short-term forecast is close to or higher than daily forecast, trust short forecast.
-            peak_load = (short_forecast_load + corrected_daily_peak) / 2
-            peak_time = now_local + timedelta(hours=1)  # predict peak in about 1 hour
-        else:
-            peak_load = corrected_daily_peak
-            # We don't have the *exact* hour from the 7-day data, so let's guess ~16-18 EPT for summer. 
-            # For demonstration, we store ~17:00 local as the peak time:
-            likely_peak_hour = datetime.combine(now_local.date(), time(17, 0)).astimezone(now_local.tzinfo)
-            peak_time = likely_peak_hour
-
-        # Rate-of-change approach if we are within 2 hours of that peak_time, 
-        # we can do an optional quick check on the last few instantaneous loads 
-        # to see if the load is ramping faster than expected:
-        if peak_time - now_local <= timedelta(hours=2) and len(self._load_history) >= 5:
-            # Some small polynomial fit or derivative check:
-            # (Example for demonstration; real code might do a curve_fit)
-            times, loads = self._extract_recent_history_arrays()
-            # Just do a quick slope check:
-            slope = np.polyfit(times, loads, 1)[0]
-            if slope > 500:  # 500 MW per hour ramp is arbitrary example
-                peak_load += slope * 1.0  # boost next-hour load by slope
-            # ... or do a quadratic approach if desired ...
-
-        return (int(round(peak_load)), peak_time)
-
-    def _calculate_forecasted_rate_of_change(self, short_forecast_data):
-        """Calculate rate of change (MW/hr) from short forecast."""
-        if not short_forecast_data or len(short_forecast_data) < 2:
-            return 0
-        loads = [x["forecast_load_mw"] for x in short_forecast_data[:2]]
-        times = [x["forecast_hour_ending"].timestamp() for x in short_forecast_data[:2]]
-        delta_load = loads[1] - loads[0]
-        delta_time = (times[1] - times[0]) / 3600  # hours
-        return delta_load / delta_time if delta_time else 0
-
-    def _calculate_instantaneous_rate_of_change(self):
-        """Calculate instantaneous load rate from history (last hour)."""
-        if len(self._load_history) < 2:
-            return 0
-        latest, oldest = self._load_history[-1], self._load_history[0]
-        delta_load = latest[1] - oldest[1]
-        delta_time = (latest[0] - oldest[0]).total_seconds() / 3600  # hours
-        return delta_load / delta_time if delta_time else 0
-
-    def _predict_time_shift(self, instantaneous_rate, forecasted_rate):
-        """Predict shift in peak timing based on rate comparison."""
-        rate_difference = instantaneous_rate - forecasted_rate
-        if abs(rate_difference) < 100:  # Arbitrary threshold MW/hr
-            return 0  # minimal shift
-        # positive rate_difference means peak arriving sooner
-        time_shift_minutes = -10 if rate_difference > 0 else 10
-        return time_shift_minutes
-
-    def _check_if_peak_hour_active(self, now_local):
+    def _record_error_and_update_bias(self):
         """
-        True if we are currently in the predicted peak hour for a high-risk day.
+        After the peak has passed, compare the actual peak load (from recent history)
+        with the predicted peak load. Record the error and adjust bias factors accordingly.
         """
-        if not self._predicted_peak_time:
-            return False
-        if self._state < self._get_fifth_highest_peak():
-            return False
-        # Round predicted peak time to the hour
-        peak_hour_floor = self._predicted_peak_time.replace(minute=0, second=0, microsecond=0)
-        return peak_hour_floor <= now_local < (peak_hour_floor + timedelta(hours=1))
-
-    def _append_load_history(self, load):
-        """
-        Store load with its timestamp (UTC) in a rolling queue.
-        """
-        now_utc = datetime.now(timezone.utc)
-        self._load_history.append((now_utc, load))
-
-    def _update_actual_daily_peaks(self, now_local):
-        """
-        For each day in load_history, track the max load. 
-        """
-        today = now_local.date()
-        # Filter loads from midnight local time to now
-        today_midnight_utc = datetime.combine(today, time.min).astimezone(timezone.utc)
-        daily_loads = [val for (ts, val) in self._load_history if ts >= today_midnight_utc]
-        if daily_loads:
-            self._actual_daily_peaks[today] = max(daily_loads)
-
-    def _update_forecasted_daily_peaks(self, seven_day_forecast):
-        """
-        Extract each day's peak from the 7-day data. 
-        """
-        daily_peaks = defaultdict(int)
-        daily_peak_times = {}
-        for item in seven_day_forecast:
-            dt_local = item["forecast_hour_ending"]
-            load_mw = item["forecast_load_mw"]
-            d = dt_local.date()
-            if load_mw > daily_peaks[d]:
-                daily_peaks[d] = load_mw
-                daily_peak_times[d] = dt_local
-
-        for d, load_val in daily_peaks.items():
-            self._forecasted_daily_peaks[d] = load_val
-            self._forecasted_daily_peak_time[d] = daily_peak_times[d]
-
-    def _update_top_five_peaks(self):
-        """
-        Recompute top-5 from all known actual daily peaks and forecast daily peaks.
-        """
-        combined = list(self._actual_daily_peaks.values()) + list(self._forecasted_daily_peaks.values())
-        # Keep only the top 5
-        self._top_five_peaks = sorted(combined, reverse=True)[:5]
+        three_hours_ago = dt_util.now() - timedelta(hours=3)
+        recent_loads = [load for (ts, load) in self._load_history if ts >= three_hours_ago]
+        if not recent_loads:
+            return
+        actual_peak = max(recent_loads)
+        error = actual_peak - (self._predicted_peak or 0)
+        self._error_history.append(error)
+        avg_error = np.mean(self._error_history) if self._error_history else 0
+        self._roc_bias -= 0.05 * (avg_error / 1000.0)
+        self._acc_bias -= 0.01 * (avg_error / 1000.0)
+        _LOGGER.info("Peak occurred: Actual=%.1f, Predicted=%.1f, error=%.1f, new biases: roc_bias=%.3f, acc_bias=%.3f",
+                    actual_peak, self._predicted_peak or 0, error, self._roc_bias, self._acc_bias)
 
     def _get_fifth_highest_peak(self):
         """
-        Return the 5th highest peak known, or the user threshold if fewer than 5.
+        Return the 5th highest peak from the known top peaks or the user-defined threshold if fewer than 5.
         """
         if len(self._top_five_peaks) < 5:
-            return self._user_defined_threshold
-        return self._top_five_peaks[-1]
+            return self._peak_threshold
+        return sorted(self._top_five_peaks, reverse=True)[4]
 
-    def _record_forecast_error(self, actual_load):
+    def _extract_time_load_arrays(self, history_deque, limit_hours=1.0):
         """
-        Compare actual load vs. today's predicted peak. 
-        If we're near or in the peak hour, or end-of-day, measure the difference.
+        Extract data from the rolling history for the past 'limit_hours' and convert times to hours
+        since the earliest timestamp.
         """
-        if not self._predicted_peak_time:
-            return
+        now = dt_util.now()
+        earliest = now - timedelta(hours=limit_hours)
+        filtered = [(ts, val) for (ts, val) in history_deque if ts >= earliest]
+        if not filtered:
+            return np.array([]), np.array([])
+        filtered.sort(key=lambda x: x[0])
+        base_time = filtered[0][0]
+        times = [(ts - base_time).total_seconds() / 3600.0 for (ts, _) in filtered]
+        loads = [val for (_, val) in filtered]
+        return np.array(times), np.array(loads)
 
-        # If it's near that peak hour, log an error:
-        now_local = datetime.now(timezone.utc).astimezone()
-        if abs((self._predicted_peak_time - now_local).total_seconds()) < 3600:
-            error = actual_load - self._state  # positive if actual > predicted
-            self._rolling_forecast_errors.append(error)
-
-    def _compute_accuracy_probability(self):
+    def _extract_time_load_arrays_short(self, forecast_data, limit_minutes=60):
         """
-        Simplified approach: If forecast error is within +/- 5 GW, consider it 'accurate.'
-        Return % of 'accurate' predictions in the rolling window.
+        Convert the short forecast data (list of dicts) into time (in hours) and load arrays,
+        limited to the first 'limit_minutes' of forecast.
         """
-        if not self._rolling_forecast_errors:
-            return "N/A"
-        valid = [err for err in self._rolling_forecast_errors if abs(err) <= 5000]
-        pct = len(valid) / len(self._rolling_forecast_errors) * 100
-        return round(pct, 1)
-
-    def _extract_recent_history_arrays(self):
-        """
-        Helper for polynomial fits. Return (times, loads) for the last N data points.
-        times in hours from the earliest timestamp.
-        """
-        # sort by timestamp ascending
-        sorted_hist = sorted(self._load_history, key=lambda x: x[0])
-        base_time = sorted_hist[0][0]
-        times = []
-        loads = []
-        for (ts, val) in sorted_hist:
-            diff_hours = (ts - base_time).total_seconds() / 3600.0
-            times.append(diff_hours)
-            loads.append(val)
+        base_time = forecast_data[0]["forecast_hour_ending"]
+        cutoff = base_time + timedelta(minutes=limit_minutes)
+        subset = [item for item in forecast_data if item["forecast_hour_ending"] <= cutoff]
+        if not subset:
+            return np.array([]), np.array([])
+        subset.sort(key=lambda x: x["forecast_hour_ending"])
+        times = [(item["forecast_hour_ending"] - base_time).total_seconds() / 3600.0 for item in subset]
+        loads = [item["forecast_load_mw"] for item in subset]
         return np.array(times), np.array(loads)
 
 class PJMData:
@@ -870,3 +812,4 @@ class PJMData:
         except Exception as err:
             _LOGGER.error("Unexpected error fetching LMP avg data: %s", err)
             return None
+
