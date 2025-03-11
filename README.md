@@ -2,52 +2,57 @@
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Default-orange.svg?style=for-the-badge)](https://github.com/custom-components/hacs)
 
-A Home Assistant integration that seductively provides PJM sensor data for monitoring zonal wholesale energy loads, forecasts, and even predicting coincident system peaks. This integration taps into PJM's DataMiner 2 API for real-time insights.
+A Home Assistant integration providing real-time PJM sensor data for monitoring zonal wholesale energy loads, forecasts, and predicting coincident system peaks. This integration utilizes PJM's DataMiner 2 API for comprehensive insights into the grid.
 
 ## Features
 
-- **Optional API Key:**  
-  - **With API Key:** Unlock the full array of sensor options with higher rate limits (up to 600 requests per minute for PJM members) and enable as many sensors as you desire.  
-  - **Without API Key:** The integration will automatically fetch the subscription key from PJM and restrict you to a maximum of **3 sensor entities** with a lower rate limit (approximately 6 requests per minute).
+- **API Key Support:**  
+  - **With API Key:** Unlocks full sensor capabilities with higher rate limits (up to 600 requests per minute for PJM members) and no sensor limit.  
+  - **Without API Key:** Automatically retrieves the subscription key from PJM but limits you to a maximum of **3 sensor entities** and a lower rate limit (~6 requests per minute).
 
 - **Default Sensors:**  
-By default, only these three alluring sensors are enabled:
+  Enabled by default:
+  - **PJM System Load** – Instantaneous system load (updates every 5 minutes).
+  - **PJM 2Hr Forecast** – Short-term load forecast with attributes including forecast_hour_ending (updates every 5 minutes).
+  - **PJM Daily System Forecast** – Daily peak load forecast with forecast_hour_ending attribute (updates hourly).
 
-  - **PJM System Load** – Instantaneous load data (formerly labeled as PJM Total Load; updates every 5 minutes).
-  - **PJM 2Hr Forecast** – Short-term load forecast (updates every 5 minutes). Its extra attributes now include the forecast_hour_ending (the time of the peak of the 2-hr forecast period) so you can see exactly when the forecast period concludes.
-  - **PJM Daily System Forecast** – Daily forecast sensor (formerly PJM Total Load Forecast). In addition to the maximum forecast load, this sensor now exposes forecast_hour_ending attribute indicating the hour-ending when the peak is expected.
+- **Additional Sensor Options (API Key Required):**  
+  Unlock additional sensors:
+  - **instantaneous_zone_load** – Zonal Instantaneous Load (5-minute updates)
+  - **zone_short_forecast** – Zonal 2Hr Forecast (5-minute updates)
+  - **zone_load_forecast** – Zonal Daily Forecast
+  - **zonal_lmp** – Hourly Average Locational Marginal Price (LMP) per zone
+  - **coincident_peak_prediction_zone** – Coincident Peak Prediction (Zone) using real-time trends and regression analysis
+  - **coincident_peak_prediction_system** – Coincident Peak Prediction (System) with 5CP logic
 
-- **Additional Sensor Options (API key required):**  
-  When you provide your API key, you can enable extra sensors, including:  
-  - **instantaneous_zone_load** – Zonal Instantaneous Load (5 minute update interval)  
-  - **zone_short_forecast** – Zonal 2Hr Forecast (5 minute update interval)  
-  - **zone_load_forecast** – Zonal Daily Forecast  
-  - **zonal_lmp** – Hourly Average Locational Marginal Price (LMP) for the selected zone  
-  - **coincident_peak_prediction_zone** – (Experimental) Coincident Peak Prediction (Zone)  
-  - **coincident_peak_prediction_system** – (Experimental) Coincident Peak Prediction (System)
+- **Advanced Coincident Peak Prediction:**  
+  - Uses real-time load trends, rate-of-change analysis, and quadratic regression to estimate system coincident peaks.
+  - Automatically tracks historical peak data to refine predictions.
+  - Identifies **high-risk days** for 5CP billing considerations.
 
 - **Rate Limiting:**  
-  Without an API key, you're limited to a modest request rate (~6 requests per minute) to play nicely with PJM’s restrictions. Provide an API key, and you can indulge in up to 600 requests per minute if you're a PJM member.
+  Without an API key, request rates are limited to **6 requests per minute**. With an API key, PJM members can make up to **600 requests per minute**.
 
-> **Note:** Data provided by PJM's DataMiner 2 API is for internal use only. Redistribution of this data or any derivative information is strictly prohibited unless you are a PJM member.
+> **Note:** Data from PJM's DataMiner 2 API is for internal use only. Redistribution or derivative data sharing is prohibited unless you are a PJM member.
 
 ## Installation
 
 1. In HACS, go to **HACS > Integrations**.
-2. Click on **+ Explore & add custom repository**.
-3. Add the repository with the following details:
+2. Click **+ Explore & add custom repository**.
+3. Add the repository:
    - **Repository:** `https://github.com/jabbauer/PJM_Sensor`
    - **Category:** Integration
-4. Once added, search for **PJM Sensor** and install it.
+4. Search for **PJM Sensor** and install it.
 5. Restart Home Assistant.
 6. Navigate to **Settings > Devices & Services** and add the **PJM Sensor** integration.
-7. In the configuration flow:
-   - **Select your utility zone.**
-   - **Enter your API key** (if you have one). If left blank, the integration will fetch the subscription key and restrict you to a maximum of **3 sensor entities**.
-   - **Choose the sensor entities** you wish to enable.
-     - By default, only **instantaneous_total_load**, **total_short_forecast**, and **total_load_forecast** are selected.
-     - Without an API key, you may only select up to 3 sensors in total.
+7. Configuration steps:
+   - Select your **utility zone**.
+   - Enter your **API key** (optional). Without it, you're limited to **3 sensor entities**.
+   - Choose the sensors you want to enable.
+     - Default: **instantaneous_total_load**, **total_short_forecast**, and **total_load_forecast**.
+     - Without an API key, a maximum of **3 sensors** can be selected.
 
 ## Disclaimer
 
-This integration is not affiliated with, nor supported by, PJM or any PJM member.
+This integration is not affiliated with, nor officially supported by, PJM or any PJM member.
+
