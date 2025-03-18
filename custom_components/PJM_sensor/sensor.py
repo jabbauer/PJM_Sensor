@@ -412,11 +412,18 @@ class CoincidentPeakPredictionSensor(SensorEntity):
             self._predicted_peak_time = None
             self._last_daily_forecast_update = None
             self._last_short_forecast_update = None
+            self._max_daily_load = None
+            self._max_daily_load_time = None
+            self._error_recorded = False
             self._current_prediction_date = now.date()
             _LOGGER.info("New day detected. Resetting daily peak predictions.")
 
         # 1. Update instantaneous load and record history.
-        await self._update_instantaneous_load()
+        if not hasattr(self, '_last_load_update') or (now - self._last_load_update) >= timedelta(minutes=5):    
+            success = await self._update_instantaneous_load()
+            if success:
+                now = dt_util.now()
+                self._last_load_update = now
         
         # 2. Compute observed ROC and acceleration from load history.
         self._compute_observed_derivatives()
@@ -431,70 +438,103 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         self._check_peak_hour_active(now)
         
         # 5. Once the predicted peak is past, record forecast error.
-        if (self._predicted_peak_time and 
-            now >= self._predicted_peak_time + timedelta(minutes=15) and 
-            not self._daily_peak_occurred):
+        if (self._state is not None and self._predicted_peak is not None and
+            self._observed_roc < 0 and
+            self._max_daily_load is not None and self._max_daily_load >= 0.85 * self._predicted_peak and
+            not getattr(self, "_error_recorded", False)):
             self._daily_peak_occurred = True
             self._record_error_and_update_bias()
-            _LOGGER.info("Peak hour passed; suspending forecast updates until next day.")
+            self._error_recorded = True
+            _LOGGER.info("Peak detected: Actual peak %.1f MW at %s. Freezing further forecasts.",
+                        self._max_daily_load, self._max_daily_load_time)
 
     async def _update_instantaneous_load(self):
-        """Fetch the current load from PJMData and update state and load history."""
+        """Fetch the current load from PJMData and update state, load history, and maximum daily load."""
         try:
             load_val = await self._pjm_data.async_update_instantaneous(self._zone)
             if load_val is not None:
+                now = dt_util.now()
                 self._state = load_val
-                self._load_history.append((dt_util.now(), load_val))
+                self._load_history.append((now, load_val))
+                
+                # Update maximum daily load within this method.
+                if not hasattr(self, "_max_daily_load") or self._max_daily_load is None:
+                    self._max_daily_load = load_val
+                    self._max_daily_load_time = now
+                elif load_val > self._max_daily_load:
+                    self._max_daily_load = load_val
+                    self._max_daily_load_time = now
+                load_val = None # Reset to ensure clean state for next update
+                return True
         except Exception as err:
             _LOGGER.error("Error updating instantaneous load: %s", err)
+        return False # Indicate Failure
 
     def _compute_observed_derivatives(self):
         """
-        Compute observed rate-of-change (ROC) and acceleration (ACC) using a simple linear slope.
-
-        - ROC (MW/hr) = (change in load) / (change in time in hours)
-        - ACC (MW/hr²) = (change in ROC) / (change in time in hours)
+        Compute observed ROC (MW/hr) and ACC (MW/hr²) using a simple moving average (SMA)
+        weighted by time, matching Home Assistant's derivative sensor algorithm.
         """
-        if len(self._load_history) < 3:
+        if len(self._load_history) < 2:
             self._observed_roc = 0.0
             self._observed_acc = 0.0
             return
 
-        # Extract time & load values within the last hour
-        now = dt_util.now()
-        one_hour_ago = now - timedelta(hours=1)
-        relevant_data = [(ts, val) for (ts, val) in self._load_history if ts >= one_hour_ago]
+        sorted_history = sorted(self._load_history, key=lambda x: x[0])
 
-        if len(relevant_data) < 2:
+        total_time_sec = 0.0
+        weighted_roc_sum = 0.0
+
+        for i in range(len(sorted_history) - 1):
+            t0, val0 = sorted_history[i]
+            t1, val1 = sorted_history[i + 1]
+            delta_time_sec = (t1 - t0).total_seconds()
+            if delta_time_sec <= 0:
+                continue
+
+            delta_load = val1 - val0
+            interval_roc = delta_load / (delta_time_sec / 3600.0)  # MW/hr
+
+            weighted_roc_sum += interval_roc * delta_time_sec
+            total_time_sec += delta_time_sec
+
+        if total_time_sec > 0:
+            self._observed_roc = weighted_roc_sum / total_time_sec
+        else:
             self._observed_roc = 0.0
+
+        # Store ROC in history for ACC calculation
+        if not hasattr(self, '_roc_history'):
+            self._roc_history = deque(maxlen=12)
+        self._roc_history.append((sorted_history[-1][0], self._observed_roc))
+
+        # Compute acceleration (ACC)
+        if len(self._roc_history) < 2:
             self._observed_acc = 0.0
             return
 
-        # Sort the data by timestamp (just in case)
-        relevant_data.sort(key=lambda x: x[0])
+        sorted_roc_history = sorted(self._roc_history, key=lambda x: x[0])
 
-        # Get the first and last point in the time window
-        t_start, load_start = relevant_data[0]
-        t_end, load_end = relevant_data[-1]
+        total_time_acc_sec = 0.0
+        weighted_acc_sum = 0.0
 
-        # Compute ROC (MW/hr)
-        time_elapsed_hrs = (t_end - t_start).total_seconds() / 3600.0
-        if time_elapsed_hrs <= 0:
-            self._observed_roc = 0.0
-            self._observed_acc = 0.0
-            return
+        for i in range(len(sorted_roc_history) - 1):
+            rt0, roc0 = sorted_roc_history[i]
+            rt1, roc1 = sorted_roc_history[i + 1]
+            delta_time_sec = (rt1 - rt0).total_seconds()
+            if delta_time_sec <= 0:
+                continue
 
-        self._observed_roc = (load_end - load_start) / time_elapsed_hrs
+            delta_roc = roc1 - roc0
+            interval_acc = delta_roc / (delta_time_sec / 3600.0)
 
-        # Compute ACC (MW/hr²) using previous ROC values
-        if hasattr(self, "_previous_roc"):
-            time_delta_hrs = time_elapsed_hrs  # time step between updates
-            self._observed_acc = (self._observed_roc - self._previous_roc) / time_delta_hrs
+            weighted_acc_sum += interval_acc * delta_time_sec
+            total_time_acc_sec += delta_time_sec
+
+        if total_time_acc_sec > 0:
+            self._observed_acc = weighted_acc_sum / total_time_acc_sec
         else:
             self._observed_acc = 0.0
-
-        # Store ROC for the next update
-        self._previous_roc = self._observed_roc
 
     async def _maybe_update_forecasts(self, now):
         """
