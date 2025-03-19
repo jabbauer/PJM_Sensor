@@ -320,6 +320,7 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         # Forecast update trackers
         self._last_daily_forecast_update = None
         self._last_short_forecast_update = None
+        self._last_kinematics_update = None
         
         # Predicted peak (from daily and short forecast refinements)
         self._predicted_peak = None
@@ -424,26 +425,35 @@ class CoincidentPeakPredictionSensor(SensorEntity):
             if success:
                 now = dt_util.now()
                 self._last_load_update = now
-        
-        # 2. Compute observed ROC and acceleration from load history.
-        self._compute_observed_derivatives()
+                # 2. Compute observed ROC and acceleration from load history.
+                self._compute_observed_derivatives()
         
         # 3. Refine predictions if the daily peak has not occurred.
+        await self._maybe_update_forecasts(now)
+
+        # 4. Run Kinematics if within 3 hours of Predicted Peak, Short Forecast and load recently updated
         if not self._daily_peak_occurred:
-            await self._maybe_update_forecasts(now)
-            self._predict_peak_using_kinematics(now)
+            time_to_peak = (self._predicted_peak_time - now) if self._predicted_peak_time else None
+            recently_updated = (self._last_short_forecast_update and (now - self._last_short_forecast_update < timedelta(minutes=10))) and \
+                            (self._last_load_update and (now - self._last_load_update < timedelta(minutes=10)))
+
+            if (time_to_peak and time_to_peak <= timedelta(hours=3) and recently_updated):
+                if not self._last_kinematics_update or (now - self._last_kinematics_update >= timedelta(minutes=5)):
+                    self._predict_peak_using_kinematics(now)
+                    self._last_kinematics_update = now
         
         # 4. Evaluate high-risk day and peak hour active status.
         self._evaluate_5cp_risk()
         self._check_peak_hour_active(now)
         
-        # 5. Once the predicted peak is past, record forecast error.
+        # 5. Once the predicted peak is past, record peak and forecast error.
         if (self._state is not None and self._predicted_peak is not None and
             self._observed_roc < 0 and
             self._max_daily_load is not None and self._max_daily_load >= 0.85 * self._predicted_peak and
             not getattr(self, "_error_recorded", False)):
             self._daily_peak_occurred = True
             self._record_error_and_update_bias()
+            self._record_daily_peak()
             self._error_recorded = True
             _LOGGER.info("Peak detected: Actual peak %.1f MW at %s. Freezing further forecasts.",
                         self._max_daily_load, self._max_daily_load_time)
@@ -464,7 +474,6 @@ class CoincidentPeakPredictionSensor(SensorEntity):
                 elif load_val > self._max_daily_load:
                     self._max_daily_load = load_val
                     self._max_daily_load_time = now
-                load_val = None # Reset to ensure clean state for next update
                 return True
         except Exception as err:
             _LOGGER.error("Error updating instantaneous load: %s", err)
@@ -540,20 +549,31 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         """
         Decide whether to pull a daily forecast (if peak is far away) or a short forecast (within 3 hours).
         """
-        time_to_peak = None
-        if self._predicted_peak_time:
-            time_to_peak = self._predicted_peak_time - now
+        if self._predicted_peak_time is None:
+            _LOGGER.info("Predicted peak time is None. Fetching daily forecast (initialization).")
+            await self._update_daily_forecast()
+            self._last_daily_forecast_update = now
+            # After fetching, re-check predicted_peak_time
+            if self._predicted_peak_time and now > self._predicted_peak_time:
+                self._daily_peak_occurred = True
+                _LOGGER.info("Initialization: Peak has already passed for today. No further forecasts.")
+                return  # Peak already passed, no further action needed
+
+        # Regular operational check after initialization
+        if self._predicted_peak_time and now > self._predicted_peak_time:
+            self._daily_peak_occurred = True
+            _LOGGER.info("Predicted peak has passed. No further forecast updates today.")
+            return
+
+        time_to_peak = self._predicted_peak_time - now if self._predicted_peak_time else None
 
         if (time_to_peak is None or time_to_peak > timedelta(hours=3)) and (
             not self._last_daily_forecast_update or (now - self._last_daily_forecast_update) >= timedelta(hours=1)
         ):
             await self._update_daily_forecast()
             self._last_daily_forecast_update = now
-
-        elif (time_to_peak is not None and time_to_peak <= timedelta(hours=3) and 
-            not self._daily_peak_occurred):
-            if (not self._last_short_forecast_update or 
-                (now - self._last_short_forecast_update) >= timedelta(minutes=5)):
+        elif time_to_peak <= timedelta(hours=3) and not self._daily_peak_occurred:
+            if (not self._last_short_forecast_update or (now - self._last_short_forecast_update) >= timedelta(minutes=5)):
                 await self._update_short_forecast()
                 self._last_short_forecast_update = now
 
@@ -714,6 +734,23 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         if len(self._top_five_peaks) < 5:
             return self._peak_threshold
         return sorted(self._top_five_peaks, reverse=True)[4]
+
+    def _record_daily_peak(self):
+        """Record the day's peak load and maintain the top five unique daily peaks."""
+        peak_date = self._max_daily_load_time.date()
+        # Check if today's peak already recorded
+        if peak_date in {timestamp.date() for timestamp, _ in self._top_five_peaks}:
+            _LOGGER.debug("Today's peak (%s) already recorded.", peak_date)
+            return
+
+        # Append and sort
+        self._top_five_peaks.append((self._max_daily_load_time, self._max_daily_load))
+        self._top_five_peaks.sort(key=lambda x: x[1], reverse=True)
+
+        # Keep only the top 5 peaks
+        if len(self._top_five_peaks) > 5:
+            removed_peak = self._top_five_peaks.pop()
+            _LOGGER.debug("Removing lowest peak %s", removed_peak)
 
     def _extract_time_load_arrays(self, history_deque, limit_hours=1.0):
         """
