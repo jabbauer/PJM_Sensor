@@ -22,6 +22,7 @@ import numpy as np
 from scipy.optimize import curve_fit
 
 from homeassistant.components.sensor import SensorEntity
+from homeassistant.components.sensor import SensorStateClass
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
@@ -109,12 +110,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         delay = 12 + (index * 12)
         hass.async_create_task(schedule_delayed_update(entity, delay))
 
-
 async def schedule_delayed_update(entity, delay):
     """Schedule an update after a delay using async sleep."""
     await asyncio.sleep(delay)
     await entity.async_update()
-
 
 class PJMSensor(SensorEntity):
     """Implementation of a standard PJM sensor."""
@@ -140,6 +139,9 @@ class PJMSensor(SensorEntity):
                     self._attr_name = f'{zone_name} {SENSOR_TYPES[sensor_type][0]}'
                 else:
                     self._attr_name += ' ' + f'{identifier}'
+        # Enable long-term statistics for system and zone load or LMP
+        if sensor_type in (CONF_INSTANTANEOUS_ZONE_LOAD, CONF_INSTANTANEOUS_TOTAL_LOAD, CONF_ZONAL_LMP):
+            self._attr_state_class = SensorStateClass.MEASUREMENT
 
     @property
     def name(self):
@@ -357,6 +359,9 @@ class CoincidentPeakPredictionSensor(SensorEntity):
 
         # **Daily Reset**: Store the current date for which the prediction applies.
         self._current_prediction_date = dt_util.now().date()
+
+        # Enable long-term statistics for zone load and system load
+        self._attr_state_class = SensorStateClass.MEASUREMENT
 
     @property
     def icon(self):
@@ -788,20 +793,25 @@ class PJMData:
     def __init__(self, websession, api_key):
         self._websession = websession
         self._subscription_key = api_key
-        self._request_times = []
+        self._request_times = deque(maxlen=6)
         self._lock = asyncio.Lock()
 
     async def _rate_limit(self):
         async with self._lock:
             now = time_module.time()
-            self._request_times = [t for t in self._request_times if now - t < 60]
-            while len(self._request_times) >= 5:
-                oldest = self._request_times[0]
-                wait_time = 60 - (now - oldest) + 1
-                _LOGGER.debug("API rate limit reached. Waiting %.2f seconds.", wait_time)
+            # Remove timestamps older than 60 seconds
+            while self._request_times and now - self._request_times[0] >= 60:
+                self._request_times.popleft()
+
+            if len(self._request_times) >= 6:
+                wait_time = 60 - (now - self._request_times[0]) + 1
+                _LOGGER.warning("PJM API rate limit reached. Waiting %.2f seconds.", wait_time)
                 await asyncio.sleep(wait_time)
+                # Clean up again after sleep
                 now = time_module.time()
-                self._request_times = [t for t in self._request_times if now - t < 60]
+                while self._request_times and now - self._request_times[0] >= 60:
+                    self._request_times.popleft()
+
             self._request_times.append(now)
 
     def _get_headers(self):
@@ -824,156 +834,240 @@ class PJMData:
             _LOGGER.error("Failed to get subscription key: %s", err)
 
     async def async_update_instantaneous(self, zone):
-        await self._rate_limit()
-        if not self._subscription_key:
-            await self._get_subscription_key()
-        end_time_utc = datetime.now(timezone.utc)
-        start_time_utc = end_time_utc - timedelta(minutes=10)
-        time_string = start_time_utc.strftime('%m/%e/%Y %H:%Mto') + end_time_utc.strftime('%m/%e/%Y %H:%M')
-        params = {
-            'rowCount': '100',
-            'sort': 'datetime_beginning_utc',
-            'order': 'Desc',
-            'startRow': '1',
-            'isActiveMetadata': 'true',
-            'fields': 'area,instantaneous_load',
-            'datetime_beginning_utc': time_string,
-        }
-        resource = "{}?{}".format(RESOURCE_INSTANTANEOUS, urllib.parse.urlencode(params))
-        headers = self._get_headers()
-        try:
-            with async_timeout.timeout(60):
-                response = await self._websession.get(resource, headers=headers)
-                data = await response.json()
-                if not data:
-                    _LOGGER.error("No load data returned for zone %s", zone)
+        retries = 3
+        backoff = 10  # seconds
+        for attempt in range(retries):
+            await self._rate_limit()
+            if not self._subscription_key:
+                await self._get_subscription_key()
+
+            end_time_utc = datetime.now(timezone.utc)
+            start_time_utc = end_time_utc - timedelta(minutes=10)
+            time_string = start_time_utc.strftime('%m/%e/%Y %H:%Mto') + end_time_utc.strftime('%m/%e/%Y %H:%M')
+            params = {
+                'rowCount': '100',
+                'sort': 'datetime_beginning_utc',
+                'order': 'Desc',
+                'startRow': '1',
+                'isActiveMetadata': 'true',
+                'fields': 'area,instantaneous_load',
+                'datetime_beginning_utc': time_string,
+            }
+            resource = f"{RESOURCE_INSTANTANEOUS}?{urllib.parse.urlencode(params)}"
+            headers = self._get_headers()
+
+            try:
+                with async_timeout.timeout(60):
+                    response = await self._websession.get(resource, headers=headers)
+                    if response.status == 429:
+                        _LOGGER.warning("PJM API rate limit exceeded (429). Retrying in %d seconds.", backoff)
+                        await asyncio.sleep(backoff)
+                        backoff *= 2
+                        continue
+
+                    data = await response.json()
+                    if not data:
+                        _LOGGER.error("No load data returned for zone %s", zone)
+                        return None
+
+                    items = data["items"]
+                    for item in items:
+                        if item["area"] == zone:
+                            return int(round(item["instantaneous_load"]))
+
+                    _LOGGER.error("Couldn't find load data for zone %s", zone)
                     return None
-                items = data["items"]
-                for item in items:
-                    if item["area"] == zone:
-                        return int(round(item["instantaneous_load"]))
-                _LOGGER.error("Couldn't find load data for zone %s", zone)
+
+            except (asyncio.TimeoutError, aiohttp.ClientError) as err:
+                _LOGGER.error("Could not get load data from PJM: %s", err)
+                await asyncio.sleep(backoff)
+                backoff *= 2
+            except Exception as err:
+                _LOGGER.error("Unexpected error fetching load data: %s", err)
                 return None
-        except (asyncio.TimeoutError, aiohttp.ClientError) as err:
-            _LOGGER.error("Could not get load data from PJM: %s", err)
-            return None
-        except Exception as err:
-            _LOGGER.error("Unexpected error fetching load data: %s", err)
-            return None
+
+        _LOGGER.error("Exhausted retries to get instantaneous load data.")
+        return None
 
     async def async_update_forecast(self, zone):
-        await self._rate_limit()
-        if not self._subscription_key:
-            await self._get_subscription_key()
-        midnight_local = datetime.combine(date.today(), time())
-        start_time_utc = midnight_local.astimezone(timezone.utc)
-        end_time_utc = start_time_utc + timedelta(hours=23, minutes=59)
-        time_string = start_time_utc.strftime('%m/%e/%Y %H:%Mto') + end_time_utc.strftime('%m/%e/%Y %H:%M')
-        params = {
-            'rowCount': '100',
-            'order': 'Asc',
-            'startRow': '1',
-            'isActiveMetadata': 'true',
-            'fields': 'forecast_datetime_ending_utc,forecast_load_mw',
-            'forecast_datetime_beginning_utc': time_string,
-            'forecast_area': zone,
-        }
-        resource = "{}?{}".format(RESOURCE_FORECAST, urllib.parse.urlencode(params))
-        headers = self._get_headers()
-        try:
-            with async_timeout.timeout(60):
-                response = await self._websession.get(resource, headers=headers)
-                full_data = await response.json()
-                data = full_data["items"]
-                forecast_data = []
-                for item in data:
-                    forecast_hour_ending = datetime.strptime(item['forecast_datetime_ending_utc'], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc).astimezone()
-                    forecast_data.append({
-                        "forecast_hour_ending": forecast_hour_ending,
-                        "forecast_load_mw": int(item["forecast_load_mw"])
-                    })
-                return forecast_data
-        except (asyncio.TimeoutError, aiohttp.ClientError) as err:
-            _LOGGER.error("Could not get forecast data from PJM: %s", err)
-            return None
-        except Exception as err:
-            _LOGGER.error("Unexpected error fetching forecast data: %s", err)
-            return None
+        retries = 3
+        backoff = 10
+        for attempt in range(retries):
+            await self._rate_limit()
+            if not self._subscription_key:
+                await self._get_subscription_key()
+
+            midnight_local = datetime.combine(date.today(), time())
+            start_time_utc = midnight_local.astimezone(timezone.utc)
+            end_time_utc = start_time_utc + timedelta(hours=23, minutes=59)
+            time_string = start_time_utc.strftime('%m/%e/%Y %H:%Mto') + end_time_utc.strftime('%m/%e/%Y %H:%M')
+            params = {
+                'rowCount': '100',
+                'order': 'Asc',
+                'startRow': '1',
+                'isActiveMetadata': 'true',
+                'fields': 'forecast_datetime_ending_utc,forecast_load_mw',
+                'forecast_datetime_beginning_utc': time_string,
+                'forecast_area': zone,
+            }
+            resource = f"{RESOURCE_FORECAST}?{urllib.parse.urlencode(params)}"
+            headers = self._get_headers()
+
+            try:
+                with async_timeout.timeout(60):
+                    response = await self._websession.get(resource, headers=headers)
+                    if response.status == 429:
+                        _LOGGER.warning("PJM API rate limit exceeded (429). Retrying in %d seconds.", backoff)
+                        await asyncio.sleep(backoff)
+                        backoff *= 2
+                        continue
+
+                    full_data = await response.json()
+                    data = full_data["items"]
+                    forecast_data = []
+                    for item in data:
+                        forecast_hour_ending = datetime.strptime(item['forecast_datetime_ending_utc'], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc).astimezone()
+                        forecast_data.append({
+                            "forecast_hour_ending": forecast_hour_ending,
+                            "forecast_load_mw": int(item["forecast_load_mw"])
+                        })
+                    return forecast_data
+
+            except (asyncio.TimeoutError, aiohttp.ClientError) as err:
+                _LOGGER.error("Could not get forecast data from PJM: %s", err)
+                await asyncio.sleep(backoff)
+                backoff *= 2
+            except Exception as err:
+                _LOGGER.error("Unexpected error fetching forecast data: %s", err)
+                return None
+
+        _LOGGER.error("Exhausted retries to get forecast data.")
+        return None
 
     async def async_update_short_forecast(self, zone):
-        await self._rate_limit()
-        if not self._subscription_key:
-            await self._get_subscription_key()
-        params = {
-            'rowCount': '48',
-            'order': 'Asc',
-            'startRow': '1',
-            'fields': 'forecast_datetime_ending_utc,forecast_load_mw',
-            'evaluated_at_ept': '5MinutesAgo',
-            'forecast_area': zone,
-        }
-        resource = "{}?{}".format(RESOURCE_SHORT_FORECAST, urllib.parse.urlencode(params))
-        headers = self._get_headers()
-        try:
-            with async_timeout.timeout(60):
-                response = await self._websession.get(resource, headers=headers)
-                full_data = await response.json()
-                data = full_data["items"]
-                
-                forecast_data = []
-                for item in data:
-                    forecast_hour_ending = datetime.strptime(item['forecast_datetime_ending_utc'], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc).astimezone()
-                    forecast_data.append({
-                        "forecast_hour_ending": forecast_hour_ending,
-                        "forecast_load_mw": int(item["forecast_load_mw"])
-                    })
-                return forecast_data
-                
-        except (asyncio.TimeoutError, aiohttp.ClientError) as err:
-            _LOGGER.error("Could not get short forecast data from PJM: %s", err)
-            return (None, None)
-        except Exception as err:
-            _LOGGER.error("Unexpected error fetching short forecast data: %s", err)
-            return (None, None)
+        retries = 3
+        backoff = 5  # seconds
+        for attempt in range(retries):
+            await self._rate_limit()
+            if not self._subscription_key:
+                await self._get_subscription_key()
+
+            params = {
+                'rowCount': '48',
+                'order': 'Asc',
+                'startRow': '1',
+                'fields': 'forecast_datetime_ending_utc,forecast_load_mw',
+                'evaluated_at_ept': '5MinutesAgo',
+                'forecast_area': zone,
+            }
+            resource = f"{RESOURCE_SHORT_FORECAST}?{urllib.parse.urlencode(params)}"
+            headers = self._get_headers()
+
+            try:
+                with async_timeout.timeout(60):
+                    response = await self._websession.get(resource, headers=headers)
+                    if response.status == 429:
+                        _LOGGER.warning("PJM API rate limit exceeded (429). Retrying in %d seconds.", backoff)
+                        await asyncio.sleep(backoff)
+                        backoff *= 2
+                        continue
+
+                    full_data = await response.json()
+                    data = full_data["items"]
+
+                    forecast_data = []
+                    for item in data:
+                        forecast_hour_ending = datetime.strptime(item['forecast_datetime_ending_utc'], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc).astimezone()
+                        forecast_data.append({
+                            "forecast_hour_ending": forecast_hour_ending,
+                            "forecast_load_mw": int(item["forecast_load_mw"])
+                        })
+                    return forecast_data
+
+            except (asyncio.TimeoutError, aiohttp.ClientError) as err:
+                _LOGGER.error("Could not get short forecast data from PJM: %s", err)
+                await asyncio.sleep(backoff)
+                backoff *= 2
+            except Exception as err:
+                _LOGGER.error("Unexpected error fetching short forecast data: %s", err)
+                return None
+
+        _LOGGER.error("Exhausted retries to get short forecast data.")
+        return None
 
     async def async_update_lmp(self, pnode_id):
-        await self._rate_limit()
-        if not self._subscription_key:
-            await self._get_subscription_key()
-        now_utc = datetime.now(timezone.utc)
-        current_minute = now_utc.minute
-        if current_minute < 5:
-            start_time_utc = (now_utc.replace(minute=4, second=0, microsecond=0) - timedelta(hours=1))
-        else:
-            start_time_utc = now_utc.replace(minute=4, second=0, microsecond=0)
-        time_string = start_time_utc.strftime('%m/%e/%Y %H:%Mto') + now_utc.strftime('%m/%e/%Y %H:%M')
-        params = {
-            'rowCount': '12',
-            'order': 'Asc',
-            'startRow': '1',
-            'datetime_beginning_utc': time_string,
-            'pnode_id': pnode_id,
-        }
-        resource = "{}?{}".format(RESOURCE_LMP, urllib.parse.urlencode(params))
-        headers = self._get_headers()
-        try:
-            with async_timeout.timeout(60):
-                response = await self._websession.get(resource, headers=headers)
-                data = await response.json()
-                if not data:
-                    _LOGGER.error("No LMP data returned for pnode_id %s", pnode_id)
-                    return None
-                items = data["items"]
-                total_lmp_values = [float(item["total_lmp_rt"]) for item in items if item["pnode_id"] == pnode_id]
-                if not total_lmp_values:
-                    _LOGGER.error("Couldn't find LMP data for pnode_id %s", pnode_id)
-                    return None
-                average_lmp = sum(total_lmp_values) / len(total_lmp_values)
-                return round(average_lmp, 2)
-        except (asyncio.TimeoutError, aiohttp.ClientError) as err:
-            _LOGGER.error("Could not get LMP avg data from PJM: %s", err)
-            return None
-        except Exception as err:
-            _LOGGER.error("Unexpected error fetching LMP avg data: %s", err)
-            return None
+        retries = 3
+        backoff = 10  # initial backoff interval in seconds
+        for attempt in range(retries):
+            await self._rate_limit()  # Ensure we respect the overall API rate limit
+
+            # Fetch subscription key if it's not already available
+            if not self._subscription_key:
+                await self._get_subscription_key()
+
+            # Define the time range for the LMP query (past ~1 hour)
+            now_utc = datetime.now(timezone.utc)
+            current_minute = now_utc.minute
+
+            if current_minute < 5:
+                # Adjust start time to the previous hour if current minute < 5
+                start_time_utc = now_utc.replace(minute=4, second=0, microsecond=0) - timedelta(hours=1)
+            else:
+                start_time_utc = now_utc.replace(minute=4, second=0, microsecond=0)
+
+            time_string = start_time_utc.strftime('%m/%e/%Y %H:%Mto') + now_utc.strftime('%m/%e/%Y %H:%M')
+
+            params = {
+                'rowCount': '12',
+                'order': 'Asc',
+                'startRow': '1',
+                'datetime_beginning_utc': time_string,
+                'pnode_id': pnode_id,
+            }
+
+            resource = f"{RESOURCE_LMP}?{urllib.parse.urlencode(params)}"
+            headers = self._get_headers()
+
+            try:
+                with async_timeout.timeout(60):
+                    response = await self._websession.get(resource, headers=headers)
+
+                    if response.status == 429:
+                        # API rate limit exceeded; perform exponential backoff and retry
+                        _LOGGER.warning("PJM API rate limit exceeded (429) while fetching LMP data. Retrying in %d seconds.", backoff)
+                        await asyncio.sleep(backoff)
+                        backoff *= 2
+                        continue
+
+                    data = await response.json()
+                    if not data:
+                        _LOGGER.error("No LMP data returned for pnode_id %s", pnode_id)
+                        return None
+
+                    items = data["items"]
+
+                    # Extract total LMP values specific to the requested pnode_id
+                    total_lmp_values = [float(item["total_lmp_rt"]) for item in items if item["pnode_id"] == pnode_id]
+
+                    if not total_lmp_values:
+                        _LOGGER.error("Couldn't find LMP data for pnode_id %s", pnode_id)
+                        return None
+
+                    # Calculate and return the average LMP value
+                    average_lmp = sum(total_lmp_values) / len(total_lmp_values)
+                    return round(average_lmp, 2)
+
+            except (asyncio.TimeoutError, aiohttp.ClientError) as err:
+                # Handle network-related errors and apply exponential backoff
+                _LOGGER.error("Could not get LMP avg data from PJM: %s", err)
+                await asyncio.sleep(backoff)
+                backoff *= 2
+            except Exception as err:
+                # Catch-all for other exceptions
+                _LOGGER.error("Unexpected error fetching LMP avg data: %s", err)
+                return None
+
+        # All retries have been exhausted
+        _LOGGER.error("Exhausted retries to get LMP data.")
+        return None
 
