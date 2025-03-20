@@ -24,8 +24,8 @@ A Home Assistant integration providing real-time PJM sensor data for monitoring 
 ## Features
 
 - **Optional API Key:**
-  - **With API Key:** Gain access to the full suite of sensors with higher rate limits (up to 600 requests per minute for PJM members).
-  - **Without API Key:** The integration will fetch the subscription key from PJM but limit you to a maximum of **3 sensor entities** with a lower rate limit (~6 requests per minute).
+  - **With API Key:** Gain access to the full suite of sensors.
+  - **Without API Key:** The integration will fetch the subscription key from PJM but limit you to a maximum of **3 sensor entities** with a lower rate limit (Recommended for testing only, otherwise risk IP ban).
 
 - **Default Sensors:**
   By default, the following three sensors are enabled:
@@ -41,10 +41,6 @@ A Home Assistant integration providing real-time PJM sensor data for monitoring 
   - **zonal_lmp** – Hourly Average Locational Marginal Price (LMP) for the selected zone
   - **coincident_peak_prediction_zone** – Coincident Peak Prediction (Zone)
   - **coincident_peak_prediction_system** – Coincident Peak Prediction (System)
-
-- **Rate Limiting:**
-  - Without an API key, the request rate is limited to ~6 requests per minute.
-  - With an API key, the request rate increases up to 600 requests per minute for PJM members.
 
 > **Note:** Data from PJM's DataMiner 2 API is for internal use only. Redistribution of this data or any derivative information is prohibited unless you are a PJM member.
 
