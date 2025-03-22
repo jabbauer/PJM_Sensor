@@ -27,6 +27,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.storage import Store
 from homeassistant.util import Throttle
 from homeassistant.util import dt as dt_util
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -100,7 +101,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             accuracy_threshold = entry.data.get(CONF_ACCURACY_THRESHOLD, DEFAULT_ACCURACY_THRESHOLD)
             dev.append(CoincidentPeakPredictionSensor(
                 pjm_data, zone if sensor_type == CONF_COINCIDENT_PEAK_PREDICTION_ZONE else PJM_RTO_ZONE,
-                peak_threshold, accuracy_threshold, sensor_type))
+                peak_threshold, accuracy_threshold, sensor_type, hass))
         else:
             dev.append(PJMSensor(pjm_data, sensor_type, identifier, None))
 
@@ -304,8 +305,9 @@ class CoincidentPeakPredictionSensor(SensorEntity):
       - Flags high-risk days based on 5CP logic.
     """
 
-    def __init__(self, pjm_data, zone, peak_threshold, accuracy_threshold, sensor_type):
+    def __init__(self, pjm_data, zone, peak_threshold, accuracy_threshold, sensor_type, hass):
         super().__init__()
+        self.hass = hass
         self._pjm_data = pjm_data
         self._zone = zone
         self._sensor_type = sensor_type
@@ -348,9 +350,15 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         self._time_error_history = deque(maxlen=30)       # errors in predicted time (hrs)
         self._magnitude_error_history = deque(maxlen=30)  # errors in predicted load (MW)
 
+        # Initialize persistent storage for peaks
+        self._store = Store(hass, 1, f"coincident_peaks_{zone}.json")
+        self._top_five_peaks = []
+
+        # Load peaks from storage
+        self.hass.async_create_task(self._async_load_peaks())
+
         # Flags and thresholds
         self._daily_peak_occurred = False
-        self._top_five_peaks = []
         self._peak_threshold = peak_threshold
         self._accuracy_threshold = accuracy_threshold
         self._high_risk_day = False
@@ -379,6 +387,11 @@ class CoincidentPeakPredictionSensor(SensorEntity):
     @property
     def extra_state_attributes(self):
         """Return additional predictive and diagnostic attributes."""
+        formatted_top_five_peaks = [
+            f"{timestamp.strftime('%B %d, %Y at %-I:%M:%S %p')} - {load:,.0f}"
+            for timestamp, load in self._top_five_peaks
+        ]
+        
         return {
             "predicted_peak": self._predicted_peak,
             "predicted_peak_time": (
@@ -387,16 +400,16 @@ class CoincidentPeakPredictionSensor(SensorEntity):
             ),
             "peak_hour_active": self._peak_hour_active,
             "high_risk_day": self._high_risk_day,
-            "observed_roc": self._observed_roc,
-            "observed_acc": self._observed_acc,
-            "forecasted_roc": self._forecasted_roc,
-            "forecasted_acc": self._forecasted_acc,
-            "bias_roc": self._roc_bias,
-            "bias_acc": self._acc_bias,
-            "time_bias": self._time_bias,
-            "magnitude_bias": self._magnitude_bias,
-            "error_history": list(self._error_history),
-            "top_five_peaks": self._top_five_peaks,
+            "observed_roc": round(self._observed_roc, 2),
+            "observed_acc": round(self._observed_acc, 2),
+            "forecasted_roc": round(self._forecasted_roc, 2),
+            "forecasted_acc": round(self._forecasted_acc, 2),
+            "bias_roc": round(self._roc_bias, 2),
+            "bias_acc": round(self._acc_bias, 2),
+            "time_bias": round(self._time_bias, 2),
+            "magnitude_bias": round(self._magnitude_bias, 2),
+            "error_history": [round(err, 2) for err in self._error_history],
+            "top_five_peaks": formatted_top_five_peaks,
         }
 
     async def async_update(self):
@@ -423,6 +436,13 @@ class CoincidentPeakPredictionSensor(SensorEntity):
             self._error_recorded = False
             self._current_prediction_date = now.date()
             _LOGGER.info("New day detected. Resetting daily peak predictions.")
+
+        # Reset peaks if it's past October 1st and last reset was before October
+        if now.date() >= date(now.year, 10, 1) and self._last_reset_date < date(now.year, 10, 1):
+            self._top_five_peaks = []
+            self._last_reset_date = date(now.year, 10, 1)
+            await self._async_save_peaks()
+            _LOGGER.info("Resetting peak history for new year (Oct 1st).")
 
         # 1. Update instantaneous load and record history.
         if not hasattr(self, '_last_load_update') or (now - self._last_load_update) >= timedelta(minutes=5):    
@@ -567,7 +587,8 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         # Regular operational check after initialization
         if self._predicted_peak_time and now > self._predicted_peak_time:
             self._daily_peak_occurred = True
-            _LOGGER.info("Predicted peak has passed. No further forecast updates today.")
+            # - Removed to avoid excess logging - Resets at Midnight
+            # _LOGGER.info("Predicted peak has passed. No further forecast updates today.")
             return
 
         time_to_peak = self._predicted_peak_time - now if self._predicted_peak_time else None
@@ -757,6 +778,9 @@ class CoincidentPeakPredictionSensor(SensorEntity):
             removed_peak = self._top_five_peaks.pop()
             _LOGGER.debug("Removing lowest peak %s", removed_peak)
 
+        # Save updated peaks
+        self.hass.async_create_task(self._async_save_peaks())
+
     def _extract_time_load_arrays(self, history_deque, limit_hours=1.0):
         """
         Extract data from the rolling history for the past 'limit_hours' and convert times to hours
@@ -787,6 +811,25 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         times = [(item["forecast_hour_ending"] - base_time).total_seconds() / 3600.0 for item in subset]
         loads = [item["forecast_load_mw"] for item in subset]
         return np.array(times), np.array(loads)
+
+    async def _async_load_peaks(self):
+        data = await self._store.async_load()
+        if data:
+            raw_peaks = data.get('top_five_peaks', [])
+            self._top_five_peaks = [
+                (dt_util.parse_datetime(timestamp), load)
+                for timestamp, load in raw_peaks
+            ]
+            self._last_reset_date = date.fromisoformat(data.get('last_reset_date'))
+        else:
+            self._top_five_peaks = []
+            self._last_reset_date = date.today()
+
+    async def _async_save_peaks(self):
+        await self._store.async_save({
+            'top_five_peaks': self._top_five_peaks,
+            'last_reset_date': self._last_reset_date.isoformat(),
+        })
 
 class PJMData:
     """Get and parse data from PJM with coordinated API rate limiting using your API key or fetched subscription key."""
@@ -1070,4 +1113,3 @@ class PJMData:
         # All retries have been exhausted
         _LOGGER.error("Exhausted retries to get LMP data.")
         return None
-
