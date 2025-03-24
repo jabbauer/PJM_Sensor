@@ -872,7 +872,8 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         """
         if len(self._top_five_peaks) < 5:
             return self._peak_threshold
-        return sorted(self._top_five_peaks, reverse=True)[4]
+        return sorted(self._top_five_peaks, key=lambda x: x[1], reverse=True)[4][1]
+
 
     def _record_daily_peak(self):
         """Record the day's peak load and maintain the top five unique daily peaks."""
