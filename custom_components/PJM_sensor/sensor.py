@@ -27,6 +27,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.storage import Store
 from homeassistant.util import Throttle
 from homeassistant.util import dt as dt_util
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -100,7 +101,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             accuracy_threshold = entry.data.get(CONF_ACCURACY_THRESHOLD, DEFAULT_ACCURACY_THRESHOLD)
             dev.append(CoincidentPeakPredictionSensor(
                 pjm_data, zone if sensor_type == CONF_COINCIDENT_PEAK_PREDICTION_ZONE else PJM_RTO_ZONE,
-                peak_threshold, accuracy_threshold, sensor_type))
+                peak_threshold, accuracy_threshold, sensor_type, hass))
         else:
             dev.append(PJMSensor(pjm_data, sensor_type, identifier, None))
 
@@ -303,9 +304,13 @@ class CoincidentPeakPredictionSensor(SensorEntity):
       - Switches between daily and short forecasts based on how close we are to the predicted peak.
       - Flags high-risk days based on 5CP logic.
     """
+    ACCELERATION_THRESHOLD = 500  # MW/hr², easy to adjust centrally
+    MAX_VALID_PEAK_WINDOW = 3    # hours
+    SMOOTHING_ALPHA = 0.3  # between 0 (more smoothing) and 1 (less smoothing)
 
-    def __init__(self, pjm_data, zone, peak_threshold, accuracy_threshold, sensor_type):
+    def __init__(self, pjm_data, zone, peak_threshold, accuracy_threshold, sensor_type, hass):
         super().__init__()
+        self.hass = hass
         self._pjm_data = pjm_data
         self._zone = zone
         self._sensor_type = sensor_type
@@ -332,7 +337,13 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         self._observed_roc = 0.0   # MW/hr
         self._observed_acc = 0.0   # MW/hr²
 
-        # Forecasted derivatives (from short forecast data, if available)
+        # Forecast Variables
+        self._daily_forecast_peak = None
+        self._daily_forecast_peak_time = None
+        self._short_forecast_peak = None
+        self._short_forecast_peak_time = None
+        self._kinematic_peak = None
+        self._kinematic_peak_time = None
         self._forecasted_roc = 0.0
         self._forecasted_acc = 0.0
         
@@ -348,9 +359,15 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         self._time_error_history = deque(maxlen=30)       # errors in predicted time (hrs)
         self._magnitude_error_history = deque(maxlen=30)  # errors in predicted load (MW)
 
+        # Initialize persistent storage for peaks
+        self._store = Store(hass, 1, f"coincident_peaks_{zone}.json")
+        self._top_five_peaks = []
+
+        # Load peaks from storage
+        self.hass.async_create_task(self._async_load_peaks())
+
         # Flags and thresholds
         self._daily_peak_occurred = False
-        self._top_five_peaks = []
         self._peak_threshold = peak_threshold
         self._accuracy_threshold = accuracy_threshold
         self._high_risk_day = False
@@ -379,6 +396,11 @@ class CoincidentPeakPredictionSensor(SensorEntity):
     @property
     def extra_state_attributes(self):
         """Return additional predictive and diagnostic attributes."""
+        formatted_top_five_peaks = [
+            f"{timestamp.strftime('%B %d, %Y at %-I:%M:%S %p')} - {load:,.0f}"
+            for timestamp, load in self._top_five_peaks
+        ]
+        
         return {
             "predicted_peak": self._predicted_peak,
             "predicted_peak_time": (
@@ -387,16 +409,16 @@ class CoincidentPeakPredictionSensor(SensorEntity):
             ),
             "peak_hour_active": self._peak_hour_active,
             "high_risk_day": self._high_risk_day,
-            "observed_roc": self._observed_roc,
-            "observed_acc": self._observed_acc,
-            "forecasted_roc": self._forecasted_roc,
-            "forecasted_acc": self._forecasted_acc,
-            "bias_roc": self._roc_bias,
-            "bias_acc": self._acc_bias,
-            "time_bias": self._time_bias,
-            "magnitude_bias": self._magnitude_bias,
-            "error_history": list(self._error_history),
-            "top_five_peaks": self._top_five_peaks,
+            "observed_roc": round(self._observed_roc, 2),
+            "observed_acc": round(self._observed_acc, 2),
+            "forecasted_roc": round(self._forecasted_roc, 2),
+            "forecasted_acc": round(self._forecasted_acc, 2),
+            "bias_roc": round(self._roc_bias, 2),
+            "bias_acc": round(self._acc_bias, 2),
+            "time_bias": round(self._time_bias, 2),
+            "magnitude_bias": round(self._magnitude_bias, 2),
+            "error_history": [round(err, 2) for err in self._error_history],
+            "top_five_peaks": "\n".join(formatted_top_five_peaks),
         }
 
     async def async_update(self):
@@ -422,7 +444,24 @@ class CoincidentPeakPredictionSensor(SensorEntity):
             self._max_daily_load_time = None
             self._error_recorded = False
             self._current_prediction_date = now.date()
+
+            self._daily_forecast_peak = None
+            self._daily_forecast_peak_time = None
+            self._short_forecast_peak = None
+            self._short_forecast_peak_time = None
+            self._kinematic_peak = None
+            self._kinematic_peak_time = None
+            self._forecasted_roc = 0.0
+            self._forecasted_acc = 0.0
+
             _LOGGER.info("New day detected. Resetting daily peak predictions.")
+
+        # Reset peaks if it's past October 1st and last reset was before October
+        if now.date() >= date(now.year, 10, 1) and self._last_reset_date < date(now.year, 10, 1):
+            self._top_five_peaks = []
+            self._last_reset_date = date(now.year, 10, 1)
+            await self._async_save_peaks()
+            _LOGGER.info("Resetting peak history for new year (Oct 1st).")
 
         # 1. Update instantaneous load and record history.
         if not hasattr(self, '_last_load_update') or (now - self._last_load_update) >= timedelta(minutes=5):    
@@ -446,7 +485,14 @@ class CoincidentPeakPredictionSensor(SensorEntity):
                 if not self._last_kinematics_update or (now - self._last_kinematics_update >= timedelta(minutes=5)):
                     self._predict_peak_using_kinematics(now)
                     self._last_kinematics_update = now
+                    self._weighted_peak_prediction()
         
+        # Check real-time load exceedance
+        if self._state and self._predicted_peak and self._state > self._predicted_peak:
+            self._predicted_peak = self._state
+            self._predicted_peak_time = now
+            _LOGGER.warning("Immediate peak adjustment due to real-time exceedance.")
+
         # 4. Evaluate high-risk day and peak hour active status.
         self._evaluate_5cp_risk()
         self._check_peak_hour_active(now)
@@ -454,7 +500,9 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         # 5. Once the predicted peak is past, record peak and forecast error.
         if (self._state is not None and self._predicted_peak is not None and
             self._observed_roc < 0 and
-            self._max_daily_load is not None and self._max_daily_load >= 0.85 * self._predicted_peak and
+            self._max_daily_load is not None and
+            self._max_daily_load >= 0.85 * self._predicted_peak and
+            dt_util.now() >= self._predicted_peak_time and
             not getattr(self, "_error_recorded", False)):
             self._daily_peak_occurred = True
             self._record_error_and_update_bias()
@@ -472,6 +520,11 @@ class CoincidentPeakPredictionSensor(SensorEntity):
                 self._state = load_val
                 self._load_history.append((now, load_val))
                 
+                #if self._state and self._predicted_peak and self._state > self._predicted_peak:
+                #    _LOGGER.warning("Real-time load %.0f MW exceeds predicted peak %.0f MW. Adjusting immediately.", self._state, self._predicted_peak)
+                #    self._predicted_peak = self._state
+                #    self._predicted_peak_time = dt_util.now()
+
                 # Update maximum daily load within this method.
                 if not hasattr(self, "_max_daily_load") or self._max_daily_load is None:
                     self._max_daily_load = load_val
@@ -489,6 +542,7 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         Compute observed ROC (MW/hr) and ACC (MW/hr²) using a simple moving average (SMA)
         weighted by time, matching Home Assistant's derivative sensor algorithm.
         """
+
         if len(self._load_history) < 2:
             self._observed_roc = 0.0
             self._observed_acc = 0.0
@@ -513,9 +567,13 @@ class CoincidentPeakPredictionSensor(SensorEntity):
             total_time_sec += delta_time_sec
 
         if total_time_sec > 0:
-            self._observed_roc = weighted_roc_sum / total_time_sec
+            new_roc = weighted_roc_sum / total_time_sec
         else:
-            self._observed_roc = 0.0
+            new_roc = 0.0
+
+        # Apply smoothing
+        alpha = self.SMOOTHING_ALPHA
+        self._observed_roc = (alpha * new_roc) + ((1 - alpha) * self._observed_roc)
 
         # Store ROC in history for ACC calculation
         if not hasattr(self, '_roc_history'):
@@ -546,9 +604,12 @@ class CoincidentPeakPredictionSensor(SensorEntity):
             total_time_acc_sec += delta_time_sec
 
         if total_time_acc_sec > 0:
-            self._observed_acc = weighted_acc_sum / total_time_acc_sec
+            new_acc = weighted_acc_sum / total_time_acc_sec
         else:
-            self._observed_acc = 0.0
+            new_acc = 0.0
+
+        # Apply smoothing
+        self._observed_acc = (alpha * new_acc) + ((1 - alpha) * self._observed_acc)
 
     async def _maybe_update_forecasts(self, now):
         """
@@ -558,29 +619,39 @@ class CoincidentPeakPredictionSensor(SensorEntity):
             _LOGGER.info("Predicted peak time is None. Fetching daily forecast (initialization).")
             await self._update_daily_forecast()
             self._last_daily_forecast_update = now
+            self._weighted_peak_prediction()
             # After fetching, re-check predicted_peak_time
-            if self._predicted_peak_time and now > self._predicted_peak_time:
-                self._daily_peak_occurred = True
-                _LOGGER.info("Initialization: Peak has already passed for today. No further forecasts.")
-                return  # Peak already passed, no further action needed
+            if self._daily_forecast_peak_time:
+                if now > self._daily_forecast_peak_time:
+                    self._daily_peak_occurred = True
+                    _LOGGER.info("Initialization: Peak has already passed for today. No further forecasts.")
+                    return  # Peak already passed, no further action needed
+            else:
+                _LOGGER.warning("Daily forecast peak time still None after initialization.")
+                return
 
         # Regular operational check after initialization
-        if self._predicted_peak_time and now > self._predicted_peak_time:
+        forecast_peak_time = self._predicted_peak_time #or self._daily_forecast_peak_time
+
+        if forecast_peak_time and now > forecast_peak_time:
             self._daily_peak_occurred = True
-            _LOGGER.info("Predicted peak has passed. No further forecast updates today.")
+            #_LOGGER.info("Predicted peak occurred -  now > forecast_peak_time, Set Daily Peak Occurred")
             return
 
-        time_to_peak = self._predicted_peak_time - now if self._predicted_peak_time else None
+        time_to_peak = forecast_peak_time - now if forecast_peak_time else None
+        _LOGGER.info("Maybe Update Forecast - Time to peak:", time_to_peak)
 
-        if (time_to_peak is None or time_to_peak > timedelta(hours=3)) and (
+        if (time_to_peak is None or time_to_peak > timedelta(hours=2)) and (
             not self._last_daily_forecast_update or (now - self._last_daily_forecast_update) >= timedelta(hours=1)
         ):
             await self._update_daily_forecast()
             self._last_daily_forecast_update = now
+            self._weighted_peak_prediction()
         elif time_to_peak <= timedelta(hours=3) and not self._daily_peak_occurred:
             if (not self._last_short_forecast_update or (now - self._last_short_forecast_update) >= timedelta(minutes=5)):
                 await self._update_short_forecast()
                 self._last_short_forecast_update = now
+                self._weighted_peak_prediction()
 
     async def _update_daily_forecast(self):
         """Pull daily forecast data and update predicted peak and time for today."""
@@ -592,36 +663,55 @@ class CoincidentPeakPredictionSensor(SensorEntity):
                 day_data = [x for x in data if x["forecast_hour_ending"].date() == today]
                 if day_data:
                     max_item = max(day_data, key=lambda x: x["forecast_load_mw"])
-                    self._predicted_peak = max_item["forecast_load_mw"]
-                    self._predicted_peak_time = max_item["forecast_hour_ending"]
-                    _LOGGER.debug("Daily forecast: peak=%.1f at %s", self._predicted_peak, self._predicted_peak_time)
+                    self._daily_forecast_peak = max_item["forecast_load_mw"]
+                    self._daily_forecast_peak_time = max_item["forecast_hour_ending"] - timedelta(hours=1)
+                    _LOGGER.info("Daily forecast: peak=%.1f at %s", self._daily_forecast_peak, self._daily_forecast_peak_time)
+                    #self._predicted_peak = max_item["forecast_load_mw"]
+                    #self._predicted_peak_time = max_item["forecast_hour_ending"]
         except Exception as err:
             _LOGGER.error("Error updating daily forecast: %s", err)
 
     async def _update_short_forecast(self):
         """
         Pull short forecast data to compute forecasted derivatives (if available) and update
-        the predicted peak if the short forecast shows a peak inside the 2-hour window.
+        separate short-term forecast attributes. These attributes are then used in weighted predictions.
         """
         try:
             forecast_zone = "RTO_COMBINED" if self._zone.upper() == "PJM RTO" else self._zone
             data = await self._pjm_data.async_update_short_forecast(forecast_zone)
             if data and len(data) > 1:
+                # Calculate forecasted derivatives for kinematic prediction
                 times, loads = self._extract_time_load_arrays_short(data, limit_minutes=60)
                 if len(times) >= 3:
                     coeffs = np.polyfit(times, loads, 2)
                     t_last = times[-1]
                     self._forecasted_roc = 2 * coeffs[0] * t_last + coeffs[1]
                     self._forecasted_acc = 2 * coeffs[0]
+                else:
+                    self._forecasted_roc = 0.0
+                    self._forecasted_acc = 0.0
+
+                # Separately store short forecast peak for weighted prediction
                 max_item = max(data, key=lambda x: x["forecast_load_mw"])
                 if max_item != data[-1]:
-                    self._predicted_peak = max_item["forecast_load_mw"]
-                    self._predicted_peak_time = max_item["forecast_hour_ending"]
-                    _LOGGER.debug("Short forecast: peak=%.1f at %s", self._predicted_peak, self._predicted_peak_time)
+                    self._short_forecast_peak = max_item["forecast_load_mw"]
+                    self._short_forecast_peak_time = max_item["forecast_hour_ending"]
+                else:
+                    self._short_forecast_peak = None
+                    self._short_forecast_peak_time = None
+            else:
+                # Clear if insufficient data
+                self._forecasted_roc = 0.0
+                self._forecasted_acc = 0.0
+                self._short_forecast_peak = None
+                self._short_forecast_peak_time = None
+
         except Exception as err:
             _LOGGER.error("Error updating short forecast: %s", err)
             self._forecasted_roc = 0.0
             self._forecasted_acc = 0.0
+            self._short_forecast_peak = None
+            self._short_forecast_peak_time = None
 
     def _predict_peak_using_kinematics(self, now):
         """
@@ -632,10 +722,12 @@ class CoincidentPeakPredictionSensor(SensorEntity):
           t = -avg_roc / avg_acc  (when avg_acc is negative as we approach a peak)
           P_peak = current_load + avg_roc*t + 0.5*avg_acc*t^2
         """
+        ACCELERATION_THRESHOLD = 50  # MW/hr², adjust based on observed data
+        MAX_VALID_PEAK_WINDOW = 3  # hours
 
         # If we don’t have a forecasted ROC yet, return early
         if self._forecasted_roc == 0 or self._forecasted_acc == 0:
-            _LOGGER.debug("Skipping kinematic prediction—forecasted ROC/ACC not available.")
+            _LOGGER.info("Skipping kinematic prediction—forecasted ROC/ACC not available.")
             return
 
         # Blend observed and forecasted values if available:
@@ -647,15 +739,24 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         if blended_acc == 0:
             return  # Insufficient trend information
         
+        # Handle implausible accelerations
+        if abs(blended_acc) < ACCELERATION_THRESHOLD:
+            _LOGGER.info("Acceleration too small, skipping kinematic prediction.")
+            return
+
         # Calculate time until peak: t = - (blended_roc) / (blended_acc)
         # (Note: blended_acc should be negative; t > 0 if the peak is ahead.)
         t_peak = -blended_roc / blended_acc
         
+        #if t_peak <= 0 or t_peak > MAX_VALID_PEAK_WINDOW:
+        #    _LOGGER.debug("Implausible peak timing predicted (%.2f hrs). Ignoring.", t_peak)
+        #    return
+
         # Apply adaptive time bias correction.
         t_peak += self._time_bias 
 
-        if t_peak <= 0:
-            # If t_peak is negative or zero, it indicates the peak is already reached.
+        if not (0 < t_peak <= 4):  # hours, realistic peak window
+            _LOGGER.info("Predicted peak time %.2f hrs invalid or unrealistic. Ignoring.", t_peak)
             return
 
         # Predicted peak load using the quadratic model:
@@ -663,13 +764,48 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         predicted_load += self._magnitude_bias
         
         # Update predicted peak attributes:
-        self._predicted_peak = int(round(predicted_load))
-        self._predicted_peak_time = now + timedelta(hours=t_peak)
-        _LOGGER.debug(
+        self._kinematic_peak = int(round(predicted_load))
+        self._kinematic_peak_time = now + timedelta(hours=t_peak)
+        #self._predicted_peak = int(round(predicted_load))
+        #self._predicted_peak_time = now + timedelta(hours=t_peak)
+        _LOGGER.info(
             "Kinematic prediction: Adjusted t_peak=%.2f hrs, Adjusted peak load=%.0f MW, "
             "time_bias=%.2f, magnitude_bias=%.1f",
             t_peak, predicted_load, self._time_bias, self._magnitude_bias
         )
+
+    def _weighted_peak_prediction(self):
+        now = dt_util.now()
+        predictions = []
+        weights = []
+
+        # Kinematic prediction (most sensitive)
+        if self._kinematic_peak_time and self._kinematic_peak:
+            time_diff = abs((self._kinematic_peak_time - now).total_seconds() / 3600)
+            if time_diff < 3:
+                predictions.append((self._kinematic_peak_time, self._kinematic_peak))
+                weights.append(0.5)  # high weight near peak time
+
+        # Short-term forecast
+        if self._short_forecast_peak_time and self._short_forecast_peak:
+            predictions.append((self._short_forecast_peak_time, self._short_forecast_peak))
+            weights.append(0.3)
+
+        # Daily forecast (less sensitive, fallback)
+        if self._daily_forecast_peak_time and self._daily_forecast_peak:
+            predictions.append((self._daily_forecast_peak_time, self._daily_forecast_peak))
+            weights.append(0.2)
+            _LOGGER.info("Daily forecast appended:", self._daily_forecast_peak, self._daily_forecast_peak_time)
+        if not predictions:
+            _LOGGER.info("No valid predictions available after weighted peak prediction calculation.")
+            return  # no valid predictions yet
+
+        # Weighted averaging
+        peak_time = sum((p[0].timestamp() * w for p, w in zip(predictions, weights))) / sum(weights)
+        peak_magnitude = sum((p[1] * w for p, w in zip(predictions, weights))) / sum(weights)
+        _LOGGER.info("Weighted Average:", peak_magnitude, peak_time)
+        self._predicted_peak_time = datetime.fromtimestamp(peak_time, tz=timezone.utc)
+        self._predicted_peak = peak_magnitude
 
     def _evaluate_5cp_risk(self):
         """Flag high-risk day if predicted peak is near or exceeds the 5th highest historical peak."""
@@ -696,14 +832,12 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         After the peak has passed, compare the actual peak load (from recent history)
         with the predicted peak load. Record the error and adjust bias factors accordingly.
         """
-        three_hours_ago = dt_util.now() - timedelta(hours=3)
-        recent_loads = [load for (ts, load) in self._load_history if ts >= three_hours_ago]
-        if not recent_loads:
+        if not self._max_daily_load or not self._predicted_peak or not self._predicted_peak_time:
             return
 
         # Determine actual peak load and its time from the recent history.
-        actual_peak = max(recent_loads)
-        actual_peak_time = max(self._load_history, key=lambda x: x[1])[0]
+        actual_peak = self._max_daily_load
+        actual_peak_time = self._max_daily_load_time
 
         if not self._predicted_peak or not self._predicted_peak_time:
             return
@@ -743,19 +877,32 @@ class CoincidentPeakPredictionSensor(SensorEntity):
     def _record_daily_peak(self):
         """Record the day's peak load and maintain the top five unique daily peaks."""
         peak_date = self._max_daily_load_time.date()
-        # Check if today's peak already recorded
-        if peak_date in {timestamp.date() for timestamp, _ in self._top_five_peaks}:
-            _LOGGER.debug("Today's peak (%s) already recorded.", peak_date)
-            return
+        updated = False
 
-        # Append and sort
-        self._top_five_peaks.append((self._max_daily_load_time, self._max_daily_load))
+        # Check if today's date is already recorded
+        for i, (ts, val) in enumerate(self._top_five_peaks):
+            if ts.date() == peak_date:
+                if self._max_daily_load > val:
+                    _LOGGER.debug("Updating today's peak from %.1f MW to %.1f MW", val, self._max_daily_load)
+                    self._top_five_peaks[i] = (self._max_daily_load_time, self._max_daily_load)
+                    updated = True
+                else:
+                    _LOGGER.debug("Today's peak (%s) already recorded and current peak %.1f MW is not higher than %.1f MW", peak_date, self._max_daily_load, val)
+                break
+
+        # If not already recorded, add the new peak
+        if not updated and all(ts.date() != peak_date for ts, _ in self._top_five_peaks):
+            _LOGGER.debug("Adding new daily peak for %s: %.1f MW", peak_date, self._max_daily_load)
+            self._top_five_peaks.append((self._max_daily_load_time, self._max_daily_load))
+
+        # Sort and trim the list to the top 5 peaks
         self._top_five_peaks.sort(key=lambda x: x[1], reverse=True)
-
-        # Keep only the top 5 peaks
         if len(self._top_five_peaks) > 5:
             removed_peak = self._top_five_peaks.pop()
             _LOGGER.debug("Removing lowest peak %s", removed_peak)
+
+        # Save updated peaks
+        self.hass.async_create_task(self._async_save_peaks())
 
     def _extract_time_load_arrays(self, history_deque, limit_hours=1.0):
         """
@@ -788,25 +935,49 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         loads = [item["forecast_load_mw"] for item in subset]
         return np.array(times), np.array(loads)
 
+    async def _async_load_peaks(self):
+        data = await self._store.async_load()
+        if data:
+            raw_peaks = data.get('top_five_peaks', [])
+            self._top_five_peaks = [
+                (dt_util.parse_datetime(timestamp), load)
+                for timestamp, load in raw_peaks
+            ]
+            self._last_reset_date = date.fromisoformat(data.get('last_reset_date'))
+        else:
+            self._top_five_peaks = []
+            self._last_reset_date = date.today()
+
+    async def _async_save_peaks(self):
+        await self._store.async_save({
+            'top_five_peaks': self._top_five_peaks,
+            'last_reset_date': self._last_reset_date.isoformat(),
+        })
+
 class PJMData:
     """Get and parse data from PJM with coordinated API rate limiting using your API key or fetched subscription key."""
     def __init__(self, websession, api_key):
         self._websession = websession
         self._subscription_key = api_key
-        self._request_times = []
+        self._request_times = deque(maxlen=6)
         self._lock = asyncio.Lock()
 
     async def _rate_limit(self):
         async with self._lock:
             now = time_module.time()
-            self._request_times = [t for t in self._request_times if now - t < 60]
-            while len(self._request_times) >= 5:
-                oldest = self._request_times[0]
-                wait_time = 60 - (now - oldest) + 1
-                _LOGGER.debug("API rate limit reached. Waiting %.2f seconds.", wait_time)
+            # Remove timestamps older than 60 seconds
+            while self._request_times and now - self._request_times[0] >= 60:
+                self._request_times.popleft()
+
+            if len(self._request_times) >= 6:
+                wait_time = 60 - (now - self._request_times[0]) + 1
+                _LOGGER.warning("PJM API rate limit reached. Waiting %.2f seconds.", wait_time)
                 await asyncio.sleep(wait_time)
+                # Clean up again after sleep
                 now = time_module.time()
-                self._request_times = [t for t in self._request_times if now - t < 60]
+                while self._request_times and now - self._request_times[0] >= 60:
+                    self._request_times.popleft()
+
             self._request_times.append(now)
 
     def _get_headers(self):
@@ -829,156 +1000,240 @@ class PJMData:
             _LOGGER.error("Failed to get subscription key: %s", err)
 
     async def async_update_instantaneous(self, zone):
-        await self._rate_limit()
-        if not self._subscription_key:
-            await self._get_subscription_key()
-        end_time_utc = datetime.now(timezone.utc)
-        start_time_utc = end_time_utc - timedelta(minutes=10)
-        time_string = start_time_utc.strftime('%m/%e/%Y %H:%Mto') + end_time_utc.strftime('%m/%e/%Y %H:%M')
-        params = {
-            'rowCount': '100',
-            'sort': 'datetime_beginning_utc',
-            'order': 'Desc',
-            'startRow': '1',
-            'isActiveMetadata': 'true',
-            'fields': 'area,instantaneous_load',
-            'datetime_beginning_utc': time_string,
-        }
-        resource = "{}?{}".format(RESOURCE_INSTANTANEOUS, urllib.parse.urlencode(params))
-        headers = self._get_headers()
-        try:
-            with async_timeout.timeout(60):
-                response = await self._websession.get(resource, headers=headers)
-                data = await response.json()
-                if not data:
-                    _LOGGER.error("No load data returned for zone %s", zone)
+        retries = 3
+        backoff = 10  # seconds
+        for attempt in range(retries):
+            await self._rate_limit()
+            if not self._subscription_key:
+                await self._get_subscription_key()
+
+            end_time_utc = datetime.now(timezone.utc)
+            start_time_utc = end_time_utc - timedelta(minutes=10)
+            time_string = start_time_utc.strftime('%m/%e/%Y %H:%Mto') + end_time_utc.strftime('%m/%e/%Y %H:%M')
+            params = {
+                'rowCount': '100',
+                'sort': 'datetime_beginning_utc',
+                'order': 'Desc',
+                'startRow': '1',
+                'isActiveMetadata': 'true',
+                'fields': 'area,instantaneous_load',
+                'datetime_beginning_utc': time_string,
+            }
+            resource = f"{RESOURCE_INSTANTANEOUS}?{urllib.parse.urlencode(params)}"
+            headers = self._get_headers()
+
+            try:
+                with async_timeout.timeout(60):
+                    response = await self._websession.get(resource, headers=headers)
+                    if response.status == 429:
+                        _LOGGER.warning("PJM API rate limit exceeded (429). Retrying in %d seconds.", backoff)
+                        await asyncio.sleep(backoff)
+                        backoff *= 2
+                        continue
+
+                    data = await response.json()
+                    if not data:
+                        _LOGGER.error("No load data returned for zone %s", zone)
+                        return None
+
+                    items = data["items"]
+                    for item in items:
+                        if item["area"] == zone:
+                            return int(round(item["instantaneous_load"]))
+
+                    _LOGGER.error("Couldn't find load data for zone %s", zone)
                     return None
-                items = data["items"]
-                for item in items:
-                    if item["area"] == zone:
-                        return int(round(item["instantaneous_load"]))
-                _LOGGER.error("Couldn't find load data for zone %s", zone)
+
+            except (asyncio.TimeoutError, aiohttp.ClientError) as err:
+                _LOGGER.error("Could not get load data from PJM: %s", err)
+                await asyncio.sleep(backoff)
+                backoff *= 2
+            except Exception as err:
+                _LOGGER.error("Unexpected error fetching load data: %s", err)
                 return None
-        except (asyncio.TimeoutError, aiohttp.ClientError) as err:
-            _LOGGER.error("Could not get load data from PJM: %s", err)
-            return None
-        except Exception as err:
-            _LOGGER.error("Unexpected error fetching load data: %s", err)
-            return None
+
+        _LOGGER.error("Exhausted retries to get instantaneous load data.")
+        return None
 
     async def async_update_forecast(self, zone):
-        await self._rate_limit()
-        if not self._subscription_key:
-            await self._get_subscription_key()
-        midnight_local = datetime.combine(date.today(), time())
-        start_time_utc = midnight_local.astimezone(timezone.utc)
-        end_time_utc = start_time_utc + timedelta(hours=23, minutes=59)
-        time_string = start_time_utc.strftime('%m/%e/%Y %H:%Mto') + end_time_utc.strftime('%m/%e/%Y %H:%M')
-        params = {
-            'rowCount': '100',
-            'order': 'Asc',
-            'startRow': '1',
-            'isActiveMetadata': 'true',
-            'fields': 'forecast_datetime_ending_utc,forecast_load_mw',
-            'forecast_datetime_beginning_utc': time_string,
-            'forecast_area': zone,
-        }
-        resource = "{}?{}".format(RESOURCE_FORECAST, urllib.parse.urlencode(params))
-        headers = self._get_headers()
-        try:
-            with async_timeout.timeout(60):
-                response = await self._websession.get(resource, headers=headers)
-                full_data = await response.json()
-                data = full_data["items"]
-                forecast_data = []
-                for item in data:
-                    forecast_hour_ending = datetime.strptime(item['forecast_datetime_ending_utc'], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc).astimezone()
-                    forecast_data.append({
-                        "forecast_hour_ending": forecast_hour_ending,
-                        "forecast_load_mw": int(item["forecast_load_mw"])
-                    })
-                return forecast_data
-        except (asyncio.TimeoutError, aiohttp.ClientError) as err:
-            _LOGGER.error("Could not get forecast data from PJM: %s", err)
-            return None
-        except Exception as err:
-            _LOGGER.error("Unexpected error fetching forecast data: %s", err)
-            return None
+        retries = 3
+        backoff = 10
+        for attempt in range(retries):
+            await self._rate_limit()
+            if not self._subscription_key:
+                await self._get_subscription_key()
+
+            midnight_local = datetime.combine(date.today(), time())
+            start_time_utc = midnight_local.astimezone(timezone.utc)
+            end_time_utc = start_time_utc + timedelta(hours=23, minutes=59)
+            time_string = start_time_utc.strftime('%m/%e/%Y %H:%Mto') + end_time_utc.strftime('%m/%e/%Y %H:%M')
+            params = {
+                'rowCount': '100',
+                'order': 'Asc',
+                'startRow': '1',
+                'isActiveMetadata': 'true',
+                'fields': 'forecast_datetime_ending_utc,forecast_load_mw',
+                'forecast_datetime_beginning_utc': time_string,
+                'forecast_area': zone,
+            }
+            resource = f"{RESOURCE_FORECAST}?{urllib.parse.urlencode(params)}"
+            headers = self._get_headers()
+
+            try:
+                with async_timeout.timeout(60):
+                    response = await self._websession.get(resource, headers=headers)
+                    if response.status == 429:
+                        _LOGGER.warning("PJM API rate limit exceeded (429). Retrying in %d seconds.", backoff)
+                        await asyncio.sleep(backoff)
+                        backoff *= 2
+                        continue
+
+                    full_data = await response.json()
+                    data = full_data["items"]
+                    forecast_data = []
+                    for item in data:
+                        forecast_hour_ending = datetime.strptime(item['forecast_datetime_ending_utc'], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc).astimezone()
+                        forecast_data.append({
+                            "forecast_hour_ending": forecast_hour_ending,
+                            "forecast_load_mw": int(item["forecast_load_mw"])
+                        })
+                    return forecast_data
+
+            except (asyncio.TimeoutError, aiohttp.ClientError) as err:
+                _LOGGER.error("Could not get forecast data from PJM: %s", err)
+                await asyncio.sleep(backoff)
+                backoff *= 2
+            except Exception as err:
+                _LOGGER.error("Unexpected error fetching forecast data: %s", err)
+                return None
+
+        _LOGGER.error("Exhausted retries to get forecast data.")
+        return None
 
     async def async_update_short_forecast(self, zone):
-        await self._rate_limit()
-        if not self._subscription_key:
-            await self._get_subscription_key()
-        params = {
-            'rowCount': '48',
-            'order': 'Asc',
-            'startRow': '1',
-            'fields': 'forecast_datetime_ending_utc,forecast_load_mw',
-            'evaluated_at_ept': '5MinutesAgo',
-            'forecast_area': zone,
-        }
-        resource = "{}?{}".format(RESOURCE_SHORT_FORECAST, urllib.parse.urlencode(params))
-        headers = self._get_headers()
-        try:
-            with async_timeout.timeout(60):
-                response = await self._websession.get(resource, headers=headers)
-                full_data = await response.json()
-                data = full_data["items"]
-                
-                forecast_data = []
-                for item in data:
-                    forecast_hour_ending = datetime.strptime(item['forecast_datetime_ending_utc'], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc).astimezone()
-                    forecast_data.append({
-                        "forecast_hour_ending": forecast_hour_ending,
-                        "forecast_load_mw": int(item["forecast_load_mw"])
-                    })
-                return forecast_data
-                
-        except (asyncio.TimeoutError, aiohttp.ClientError) as err:
-            _LOGGER.error("Could not get short forecast data from PJM: %s", err)
-            return (None, None)
-        except Exception as err:
-            _LOGGER.error("Unexpected error fetching short forecast data: %s", err)
-            return (None, None)
+        retries = 3
+        backoff = 5  # seconds
+        for attempt in range(retries):
+            await self._rate_limit()
+            if not self._subscription_key:
+                await self._get_subscription_key()
+
+            params = {
+                'rowCount': '48',
+                'order': 'Asc',
+                'startRow': '1',
+                'fields': 'forecast_datetime_ending_utc,forecast_load_mw',
+                'evaluated_at_ept': '5MinutesAgo',
+                'forecast_area': zone,
+            }
+            resource = f"{RESOURCE_SHORT_FORECAST}?{urllib.parse.urlencode(params)}"
+            headers = self._get_headers()
+
+            try:
+                with async_timeout.timeout(60):
+                    response = await self._websession.get(resource, headers=headers)
+                    if response.status == 429:
+                        _LOGGER.warning("PJM API rate limit exceeded (429). Retrying in %d seconds.", backoff)
+                        await asyncio.sleep(backoff)
+                        backoff *= 2
+                        continue
+
+                    full_data = await response.json()
+                    data = full_data["items"]
+
+                    forecast_data = []
+                    for item in data:
+                        forecast_hour_ending = datetime.strptime(item['forecast_datetime_ending_utc'], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc).astimezone()
+                        forecast_data.append({
+                            "forecast_hour_ending": forecast_hour_ending,
+                            "forecast_load_mw": int(item["forecast_load_mw"])
+                        })
+                    return forecast_data
+
+            except (asyncio.TimeoutError, aiohttp.ClientError) as err:
+                _LOGGER.error("Could not get short forecast data from PJM: %s", err)
+                await asyncio.sleep(backoff)
+                backoff *= 2
+            except Exception as err:
+                _LOGGER.error("Unexpected error fetching short forecast data: %s", err)
+                return None
+
+        _LOGGER.error("Exhausted retries to get short forecast data.")
+        return None
 
     async def async_update_lmp(self, pnode_id):
-        await self._rate_limit()
-        if not self._subscription_key:
-            await self._get_subscription_key()
-        now_utc = datetime.now(timezone.utc)
-        current_minute = now_utc.minute
-        if current_minute < 5:
-            start_time_utc = (now_utc.replace(minute=4, second=0, microsecond=0) - timedelta(hours=1))
-        else:
-            start_time_utc = now_utc.replace(minute=4, second=0, microsecond=0)
-        time_string = start_time_utc.strftime('%m/%e/%Y %H:%Mto') + now_utc.strftime('%m/%e/%Y %H:%M')
-        params = {
-            'rowCount': '12',
-            'order': 'Asc',
-            'startRow': '1',
-            'datetime_beginning_utc': time_string,
-            'pnode_id': pnode_id,
-        }
-        resource = "{}?{}".format(RESOURCE_LMP, urllib.parse.urlencode(params))
-        headers = self._get_headers()
-        try:
-            with async_timeout.timeout(60):
-                response = await self._websession.get(resource, headers=headers)
-                data = await response.json()
-                if not data:
-                    _LOGGER.error("No LMP data returned for pnode_id %s", pnode_id)
-                    return None
-                items = data["items"]
-                total_lmp_values = [float(item["total_lmp_rt"]) for item in items if item["pnode_id"] == pnode_id]
-                if not total_lmp_values:
-                    _LOGGER.error("Couldn't find LMP data for pnode_id %s", pnode_id)
-                    return None
-                average_lmp = sum(total_lmp_values) / len(total_lmp_values)
-                return round(average_lmp, 2)
-        except (asyncio.TimeoutError, aiohttp.ClientError) as err:
-            _LOGGER.error("Could not get LMP avg data from PJM: %s", err)
-            return None
-        except Exception as err:
-            _LOGGER.error("Unexpected error fetching LMP avg data: %s", err)
-            return None
+        retries = 3
+        backoff = 10  # initial backoff interval in seconds
+        for attempt in range(retries):
+            await self._rate_limit()  # Ensure we respect the overall API rate limit
+
+            # Fetch subscription key if it's not already available
+            if not self._subscription_key:
+                await self._get_subscription_key()
+
+            # Define the time range for the LMP query (past ~1 hour)
+            now_utc = datetime.now(timezone.utc)
+            current_minute = now_utc.minute
+
+            if current_minute < 5:
+                # Adjust start time to the previous hour if current minute < 5
+                start_time_utc = now_utc.replace(minute=4, second=0, microsecond=0) - timedelta(hours=1)
+            else:
+                start_time_utc = now_utc.replace(minute=4, second=0, microsecond=0)
+
+            time_string = start_time_utc.strftime('%m/%e/%Y %H:%Mto') + now_utc.strftime('%m/%e/%Y %H:%M')
+
+            params = {
+                'rowCount': '12',
+                'order': 'Asc',
+                'startRow': '1',
+                'datetime_beginning_utc': time_string,
+                'pnode_id': pnode_id,
+            }
+
+            resource = f"{RESOURCE_LMP}?{urllib.parse.urlencode(params)}"
+            headers = self._get_headers()
+
+            try:
+                with async_timeout.timeout(60):
+                    response = await self._websession.get(resource, headers=headers)
+
+                    if response.status == 429:
+                        # API rate limit exceeded; perform exponential backoff and retry
+                        _LOGGER.warning("PJM API rate limit exceeded (429) while fetching LMP data. Retrying in %d seconds.", backoff)
+                        await asyncio.sleep(backoff)
+                        backoff *= 2
+                        continue
+
+                    data = await response.json()
+                    if not data:
+                        _LOGGER.error("No LMP data returned for pnode_id %s", pnode_id)
+                        return None
+
+                    items = data["items"]
+
+                    # Extract total LMP values specific to the requested pnode_id
+                    total_lmp_values = [float(item["total_lmp_rt"]) for item in items if item["pnode_id"] == pnode_id]
+
+                    if not total_lmp_values:
+                        _LOGGER.error("Couldn't find LMP data for pnode_id %s", pnode_id)
+                        return None
+
+                    # Calculate and return the average LMP value
+                    average_lmp = sum(total_lmp_values) / len(total_lmp_values)
+                    return round(average_lmp, 2)
+
+            except (asyncio.TimeoutError, aiohttp.ClientError) as err:
+                # Handle network-related errors and apply exponential backoff
+                _LOGGER.error("Could not get LMP avg data from PJM: %s", err)
+                await asyncio.sleep(backoff)
+                backoff *= 2
+            except Exception as err:
+                # Catch-all for other exceptions
+                _LOGGER.error("Unexpected error fetching LMP avg data: %s", err)
+                return None
+
+        # All retries have been exhausted
+        _LOGGER.error("Exhausted retries to get LMP data.")
+        return None
 
