@@ -304,6 +304,9 @@ class CoincidentPeakPredictionSensor(SensorEntity):
       - Switches between daily and short forecasts based on how close we are to the predicted peak.
       - Flags high-risk days based on 5CP logic.
     """
+    ACCELERATION_THRESHOLD = 500  # MW/hr², easy to adjust centrally
+    MAX_VALID_PEAK_WINDOW = 3    # hours
+    SMOOTHING_ALPHA = 0.3  # between 0 (more smoothing) and 1 (less smoothing)
 
     def __init__(self, pjm_data, zone, peak_threshold, accuracy_threshold, sensor_type, hass):
         super().__init__()
@@ -334,7 +337,13 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         self._observed_roc = 0.0   # MW/hr
         self._observed_acc = 0.0   # MW/hr²
 
-        # Forecasted derivatives (from short forecast data, if available)
+        # Forecast Variables
+        self._daily_forecast_peak = None
+        self._daily_forecast_peak_time = None
+        self._short_forecast_peak = None
+        self._short_forecast_peak_time = None
+        self._kinematic_peak = None
+        self._kinematic_peak_time = None
         self._forecasted_roc = 0.0
         self._forecasted_acc = 0.0
         
@@ -409,7 +418,7 @@ class CoincidentPeakPredictionSensor(SensorEntity):
             "time_bias": round(self._time_bias, 2),
             "magnitude_bias": round(self._magnitude_bias, 2),
             "error_history": [round(err, 2) for err in self._error_history],
-            "top_five_peaks": formatted_top_five_peaks,
+            "top_five_peaks": "\n".join(formatted_top_five_peaks),
         }
 
     async def async_update(self):
@@ -435,6 +444,16 @@ class CoincidentPeakPredictionSensor(SensorEntity):
             self._max_daily_load_time = None
             self._error_recorded = False
             self._current_prediction_date = now.date()
+
+            self._daily_forecast_peak = None
+            self._daily_forecast_peak_time = None
+            self._short_forecast_peak = None
+            self._short_forecast_peak_time = None
+            self._kinematic_peak = None
+            self._kinematic_peak_time = None
+            self._forecasted_roc = 0.0
+            self._forecasted_acc = 0.0
+
             _LOGGER.info("New day detected. Resetting daily peak predictions.")
 
         # Reset peaks if it's past October 1st and last reset was before October
@@ -456,17 +475,24 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         # 3. Refine predictions if the daily peak has not occurred.
         await self._maybe_update_forecasts(now)
 
-        # 4. Run Kinematics if within 3 hours of Predicted Peak, Short Forecast and load recently updated
+        # 4. Run Kinematics if within 1.5 hours of Predicted Peak, Short Forecast and load recently updated
         if not self._daily_peak_occurred:
             time_to_peak = (self._predicted_peak_time - now) if self._predicted_peak_time else None
             recently_updated = (self._last_short_forecast_update and (now - self._last_short_forecast_update < timedelta(minutes=10))) and \
                             (self._last_load_update and (now - self._last_load_update < timedelta(minutes=10)))
 
-            if (time_to_peak and time_to_peak <= timedelta(hours=3) and recently_updated):
+            if (time_to_peak and time_to_peak <= timedelta(minutes=110) and recently_updated):
                 if not self._last_kinematics_update or (now - self._last_kinematics_update >= timedelta(minutes=5)):
                     self._predict_peak_using_kinematics(now)
                     self._last_kinematics_update = now
+                    self._weighted_peak_prediction()
         
+        # Check real-time load exceedance
+        if self._state and self._predicted_peak and self._state > self._predicted_peak:
+            self._predicted_peak = self._state
+            self._predicted_peak_time = now
+            _LOGGER.warning("Immediate peak adjustment due to real-time exceedance.")
+
         # 4. Evaluate high-risk day and peak hour active status.
         self._evaluate_5cp_risk()
         self._check_peak_hour_active(now)
@@ -474,7 +500,9 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         # 5. Once the predicted peak is past, record peak and forecast error.
         if (self._state is not None and self._predicted_peak is not None and
             self._observed_roc < 0 and
-            self._max_daily_load is not None and self._max_daily_load >= 0.85 * self._predicted_peak and
+            self._max_daily_load is not None and
+            self._max_daily_load >= 0.85 * self._predicted_peak and
+            dt_util.now() >= self._predicted_peak_time and
             not getattr(self, "_error_recorded", False)):
             self._daily_peak_occurred = True
             self._record_error_and_update_bias()
@@ -492,6 +520,11 @@ class CoincidentPeakPredictionSensor(SensorEntity):
                 self._state = load_val
                 self._load_history.append((now, load_val))
                 
+                #if self._state and self._predicted_peak and self._state > self._predicted_peak:
+                #    _LOGGER.warning("Real-time load %.0f MW exceeds predicted peak %.0f MW. Adjusting immediately.", self._state, self._predicted_peak)
+                #    self._predicted_peak = self._state
+                #    self._predicted_peak_time = dt_util.now()
+
                 # Update maximum daily load within this method.
                 if not hasattr(self, "_max_daily_load") or self._max_daily_load is None:
                     self._max_daily_load = load_val
@@ -509,6 +542,7 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         Compute observed ROC (MW/hr) and ACC (MW/hr²) using a simple moving average (SMA)
         weighted by time, matching Home Assistant's derivative sensor algorithm.
         """
+
         if len(self._load_history) < 2:
             self._observed_roc = 0.0
             self._observed_acc = 0.0
@@ -533,9 +567,13 @@ class CoincidentPeakPredictionSensor(SensorEntity):
             total_time_sec += delta_time_sec
 
         if total_time_sec > 0:
-            self._observed_roc = weighted_roc_sum / total_time_sec
+            new_roc = weighted_roc_sum / total_time_sec
         else:
-            self._observed_roc = 0.0
+            new_roc = 0.0
+
+        # Apply smoothing
+        alpha = self.SMOOTHING_ALPHA
+        self._observed_roc = (alpha * new_roc) + ((1 - alpha) * self._observed_roc)
 
         # Store ROC in history for ACC calculation
         if not hasattr(self, '_roc_history'):
@@ -566,9 +604,12 @@ class CoincidentPeakPredictionSensor(SensorEntity):
             total_time_acc_sec += delta_time_sec
 
         if total_time_acc_sec > 0:
-            self._observed_acc = weighted_acc_sum / total_time_acc_sec
+            new_acc = weighted_acc_sum / total_time_acc_sec
         else:
-            self._observed_acc = 0.0
+            new_acc = 0.0
+
+        # Apply smoothing
+        self._observed_acc = (alpha * new_acc) + ((1 - alpha) * self._observed_acc)
 
     async def _maybe_update_forecasts(self, now):
         """
@@ -578,30 +619,39 @@ class CoincidentPeakPredictionSensor(SensorEntity):
             _LOGGER.info("Predicted peak time is None. Fetching daily forecast (initialization).")
             await self._update_daily_forecast()
             self._last_daily_forecast_update = now
+            self._weighted_peak_prediction()
             # After fetching, re-check predicted_peak_time
-            if self._predicted_peak_time and now > self._predicted_peak_time:
-                self._daily_peak_occurred = True
-                _LOGGER.info("Initialization: Peak has already passed for today. No further forecasts.")
-                return  # Peak already passed, no further action needed
+            if self._daily_forecast_peak_time:
+                if now > self._daily_forecast_peak_time:
+                    self._daily_peak_occurred = True
+                    _LOGGER.info("Initialization: Peak has already passed for today. No further forecasts.")
+                    return  # Peak already passed, no further action needed
+            else:
+                _LOGGER.warning("Daily forecast peak time still None after initialization.")
+                return
 
         # Regular operational check after initialization
-        if self._predicted_peak_time and now > self._predicted_peak_time:
+        forecast_peak_time = self._predicted_peak_time #or self._daily_forecast_peak_time
+
+        if forecast_peak_time and now > forecast_peak_time:
             self._daily_peak_occurred = True
-            # - Removed to avoid excess logging - Resets at Midnight
-            # _LOGGER.info("Predicted peak has passed. No further forecast updates today.")
+            #_LOGGER.info("Predicted peak occurred -  now > forecast_peak_time, Set Daily Peak Occurred")
             return
 
-        time_to_peak = self._predicted_peak_time - now if self._predicted_peak_time else None
+        time_to_peak = forecast_peak_time - now if forecast_peak_time else None
+        _LOGGER.info("Maybe Update Forecast - Time to peak:", time_to_peak)
 
-        if (time_to_peak is None or time_to_peak > timedelta(hours=3)) and (
+        if (time_to_peak is None or time_to_peak > timedelta(hours=2)) and (
             not self._last_daily_forecast_update or (now - self._last_daily_forecast_update) >= timedelta(hours=1)
         ):
             await self._update_daily_forecast()
             self._last_daily_forecast_update = now
+            self._weighted_peak_prediction()
         elif time_to_peak <= timedelta(hours=3) and not self._daily_peak_occurred:
             if (not self._last_short_forecast_update or (now - self._last_short_forecast_update) >= timedelta(minutes=5)):
                 await self._update_short_forecast()
                 self._last_short_forecast_update = now
+                self._weighted_peak_prediction()
 
     async def _update_daily_forecast(self):
         """Pull daily forecast data and update predicted peak and time for today."""
@@ -613,84 +663,187 @@ class CoincidentPeakPredictionSensor(SensorEntity):
                 day_data = [x for x in data if x["forecast_hour_ending"].date() == today]
                 if day_data:
                     max_item = max(day_data, key=lambda x: x["forecast_load_mw"])
-                    self._predicted_peak = max_item["forecast_load_mw"]
-                    self._predicted_peak_time = max_item["forecast_hour_ending"]
-                    _LOGGER.debug("Daily forecast: peak=%.1f at %s", self._predicted_peak, self._predicted_peak_time)
+                    self._daily_forecast_peak = max_item["forecast_load_mw"]
+                    self._daily_forecast_peak_time = max_item["forecast_hour_ending"] - timedelta(hours=1)
+                    _LOGGER.info("Daily forecast: peak=%.1f at %s", self._daily_forecast_peak, self._daily_forecast_peak_time)
+                    #self._predicted_peak = max_item["forecast_load_mw"]
+                    #self._predicted_peak_time = max_item["forecast_hour_ending"]
         except Exception as err:
             _LOGGER.error("Error updating daily forecast: %s", err)
 
     async def _update_short_forecast(self):
         """
         Pull short forecast data to compute forecasted derivatives (if available) and update
-        the predicted peak if the short forecast shows a peak inside the 2-hour window.
+        separate short-term forecast attributes. These attributes are then used in weighted predictions.
         """
         try:
             forecast_zone = "RTO_COMBINED" if self._zone.upper() == "PJM RTO" else self._zone
             data = await self._pjm_data.async_update_short_forecast(forecast_zone)
             if data and len(data) > 1:
+                # Calculate forecasted derivatives for kinematic prediction
                 times, loads = self._extract_time_load_arrays_short(data, limit_minutes=60)
                 if len(times) >= 3:
                     coeffs = np.polyfit(times, loads, 2)
                     t_last = times[-1]
                     self._forecasted_roc = 2 * coeffs[0] * t_last + coeffs[1]
                     self._forecasted_acc = 2 * coeffs[0]
+                else:
+                    self._forecasted_roc = 0.0
+                    self._forecasted_acc = 0.0
+
+                # Separately store short forecast peak for weighted prediction
                 max_item = max(data, key=lambda x: x["forecast_load_mw"])
                 if max_item != data[-1]:
-                    self._predicted_peak = max_item["forecast_load_mw"]
-                    self._predicted_peak_time = max_item["forecast_hour_ending"]
-                    _LOGGER.debug("Short forecast: peak=%.1f at %s", self._predicted_peak, self._predicted_peak_time)
+                    self._short_forecast_peak = max_item["forecast_load_mw"]
+                    self._short_forecast_peak_time = max_item["forecast_hour_ending"]
+                else:
+                    self._short_forecast_peak = None
+                    self._short_forecast_peak_time = None
+            else:
+                # Clear if insufficient data
+                self._forecasted_roc = 0.0
+                self._forecasted_acc = 0.0
+                self._short_forecast_peak = None
+                self._short_forecast_peak_time = None
+
         except Exception as err:
             _LOGGER.error("Error updating short forecast: %s", err)
             self._forecasted_roc = 0.0
             self._forecasted_acc = 0.0
+            self._short_forecast_peak = None
+            self._short_forecast_peak_time = None
 
     def _predict_peak_using_kinematics(self, now):
         """
         Use the current load, observed ROC and ACC (optionally blended with forecasted values
         and bias adjustments) to predict the peak time and load.
-        
-        Using:
-          t = -avg_roc / avg_acc  (when avg_acc is negative as we approach a peak)
-          P_peak = current_load + avg_roc*t + 0.5*avg_acc*t^2
+        Applies adaptive blending based on time_to_peak.
         """
+        # Thresholds and constants
+        ACCELERATION_THRESHOLD = 50  # Min abs acceleration magnitude (MW/hr²) - TUNE THIS
+        MIN_DECELERATION = 50       # Min abs negative acceleration (MW/hr²) - TUNE THIS
+        MAX_VALID_PEAK_WINDOW_HRS = 4 # Max hours ahead for valid prediction
 
-        # If we don’t have a forecasted ROC yet, return early
-        if self._forecasted_roc == 0 or self._forecasted_acc == 0:
-            _LOGGER.debug("Skipping kinematic prediction—forecasted ROC/ACC not available.")
+        _LOGGER.info( # Log raw inputs once
+            "Kinematic inputs: current_load=%.1f, obs_roc=%.2f, obs_acc=%.2f, "
+            "fcst_roc=%.2f, fcst_acc=%.2f, roc_bias=%.2f, acc_bias=%.2f",
+            self._state or 0.0, self._observed_roc, self._observed_acc,
+            self._forecasted_roc, self._forecasted_acc, self._roc_bias, self._acc_bias
+        )
+
+        # Check if forecast derivatives are available
+        if self._forecasted_roc == 0 and self._forecasted_acc == 0: # Allow if only one is zero maybe?
+            _LOGGER.info("Skipping kinematic: Forecasted ROC/ACC insufficient.")
+            self._kinematic_peak = None; self._kinematic_peak_time = None
             return
 
-        # Blend observed and forecasted values if available:
-        # Here, we apply a simple average with bias adjustments.
-        blended_roc = 0.5 * (self._observed_roc + self._forecasted_roc) + self._roc_bias
-        blended_acc = 0.5 * (self._observed_acc + self._forecasted_acc) + self._acc_bias
+        # --- Adaptive Blending ---
+        time_to_peak_hrs = float('inf') # Default to infinity if no prediction yet
+        if self._predicted_peak_time:
+            time_diff_sec = (self._predicted_peak_time - now).total_seconds()
+            if time_diff_sec > 0: # Only consider future predicted peaks
+                time_to_peak_hrs = time_diff_sec / 3600.0
 
-        # When approaching the peak, ROC is positive but decelerating (i.e. blended_acc is negative)
+        # Define weighting function (linear ramp example)
+        # Weight shifts towards observed data as predicted time approaches.
+        # obs_weight = 1.0 means fully observed, 0.0 means fully forecast.
+        # Range: From 0.2 obs weight at 2+ hrs away, up to 0.8 obs weight at 0.5 hrs or less.
+        obs_weight = np.clip(1.0 - (time_to_peak_hrs - 0.5) / (2.0 - 0.5), 0.1, 0.9)
+        fcst_weight = 1.0 - obs_weight
+        _LOGGER.info(f"Adaptive Blend Weights (time_to_peak={time_to_peak_hrs:.2f} hrs): obs={obs_weight:.2f}, fcst={fcst_weight:.2f}")
+
+        blended_roc = (obs_weight * self._observed_roc + fcst_weight * self._forecasted_roc) + self._roc_bias
+        blended_acc = (obs_weight * self._observed_acc + fcst_weight * self._forecasted_acc) + self._acc_bias
+        # --- End Adaptive Blending ---
+
+
+        _LOGGER.info(
+            "Kinematic blended values: blended_roc=%.2f, blended_acc=%.2f",
+            blended_roc, blended_acc
+        )
+
+        # --- Guard Conditions ---
         if blended_acc == 0:
-            return  # Insufficient trend information
-        
-        # Calculate time until peak: t = - (blended_roc) / (blended_acc)
-        # (Note: blended_acc should be negative; t > 0 if the peak is ahead.)
-        t_peak = -blended_roc / blended_acc
-        
-        # Apply adaptive time bias correction.
-        t_peak += self._time_bias 
+            _LOGGER.info("Skipping kinematic: blended_acc is zero.")
+            self._kinematic_peak = None; self._kinematic_peak_time = None
+            return
+        if blended_acc >= 0: # Require deceleration
+            _LOGGER.info("Skipping kinematic: blended_acc (%.2f) is non-negative.", blended_acc)
+            self._kinematic_peak = None; self._kinematic_peak_time = None
+            return
+        if abs(blended_acc) < MIN_DECELERATION: # Require minimum deceleration magnitude
+            _LOGGER.info("Skipping kinematic: blended_acc magnitude |%.2f| < threshold %.1f.", blended_acc, MIN_DECELERATION)
+            self._kinematic_peak = None; self._kinematic_peak_time = None
+            return
+        # --- End Guards ---
 
-        if t_peak <= 0:
-            # If t_peak is negative or zero, it indicates the peak is already reached.
+        # Calculate raw t_peak
+        raw_t_peak = -blended_roc / blended_acc
+        _LOGGER.info("Kinematic raw calculation: raw_t_peak=%.2f hrs", raw_t_peak)
+
+        # Apply adaptive time bias
+        t_peak = raw_t_peak + self._time_bias
+        _LOGGER.info("Kinematic after time bias: t_peak=%.2f hrs", t_peak)
+
+        # Check final time validity
+        if not (0 < t_peak <= MAX_VALID_PEAK_WINDOW_HRS):
+            _LOGGER.info(
+                "Predicted peak time %.2f hrs (adjusted) invalid or unrealistic (raw: %.2f hrs). Ignoring.",
+                t_peak, raw_t_peak
+            )
+            self._kinematic_peak = None; self._kinematic_peak_time = None
             return
 
-        # Predicted peak load using the quadratic model:
+        # Calculate predicted load using blended values and adjusted time
+        if self._state is None: # Need current load for prediction
+            _LOGGER.warning("Skipping kinematic load calculation: current state is None.")
+            self._kinematic_peak = None; self._kinematic_peak_time = None
+            return
+            
         predicted_load = self._state + blended_roc * t_peak + 0.5 * blended_acc * (t_peak ** 2)
         predicted_load += self._magnitude_bias
-        
-        # Update predicted peak attributes:
-        self._predicted_peak = int(round(predicted_load))
-        self._predicted_peak_time = now + timedelta(hours=t_peak)
-        _LOGGER.debug(
-            "Kinematic prediction: Adjusted t_peak=%.2f hrs, Adjusted peak load=%.0f MW, "
-            "time_bias=%.2f, magnitude_bias=%.1f",
-            t_peak, predicted_load, self._time_bias, self._magnitude_bias
+
+        # Update kinematic state
+        self._kinematic_peak = int(round(predicted_load))
+        self._kinematic_peak_time = now + timedelta(hours=t_peak)
+
+        _LOGGER.info(
+            "Kinematic Prediction SUCCESS: Peak=%.0f MW at %s (in %.2f hrs)",
+            self._kinematic_peak, self._kinematic_peak_time.isoformat(), t_peak
         )
+
+    def _weighted_peak_prediction(self):
+        now = dt_util.now()
+        predictions = []
+        weights = []
+
+        # Kinematic prediction (most sensitive)
+        if self._kinematic_peak_time and self._kinematic_peak:
+            time_diff = abs((self._kinematic_peak_time - now).total_seconds() / 3600)
+            if time_diff < 3:
+                predictions.append((self._kinematic_peak_time, self._kinematic_peak))
+                weights.append(0.5)  # high weight near peak time
+
+        # Short-term forecast
+        if self._short_forecast_peak_time and self._short_forecast_peak:
+            predictions.append((self._short_forecast_peak_time, self._short_forecast_peak))
+            weights.append(0.3)
+
+        # Daily forecast (less sensitive, fallback)
+        if self._daily_forecast_peak_time and self._daily_forecast_peak:
+            predictions.append((self._daily_forecast_peak_time, self._daily_forecast_peak))
+            weights.append(0.2)
+            _LOGGER.info("Daily forecast appended:", self._daily_forecast_peak, self._daily_forecast_peak_time)
+        if not predictions:
+            _LOGGER.info("No valid predictions available after weighted peak prediction calculation.")
+            return  # no valid predictions yet
+
+        # Weighted averaging
+        peak_time = sum((p[0].timestamp() * w for p, w in zip(predictions, weights))) / sum(weights)
+        peak_magnitude = sum((p[1] * w for p, w in zip(predictions, weights))) / sum(weights)
+        _LOGGER.info("Weighted Average:", peak_magnitude, peak_time)
+        self._predicted_peak_time = datetime.fromtimestamp(peak_time, tz=timezone.utc)
+        self._predicted_peak = peak_magnitude
 
     def _evaluate_5cp_risk(self):
         """Flag high-risk day if predicted peak is near or exceeds the 5th highest historical peak."""
@@ -717,39 +870,88 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         After the peak has passed, compare the actual peak load (from recent history)
         with the predicted peak load. Record the error and adjust bias factors accordingly.
         """
-        three_hours_ago = dt_util.now() - timedelta(hours=3)
-        recent_loads = [load for (ts, load) in self._load_history if ts >= three_hours_ago]
-        if not recent_loads:
+        # Initial check: Make sure the necessary source attributes are present
+        if not self._max_daily_load or not self._predicted_peak or not self._predicted_peak_time:
+            # Changed level to DEBUG as this is normal operation if conditions not met
+            _LOGGER.debug("Skipping error recording: Missing max_daily_load, predicted_peak, or predicted_peak_time.")
             return
 
-        # Determine actual peak load and its time from the recent history.
-        actual_peak = max(recent_loads)
-        actual_peak_time = max(self._load_history, key=lambda x: x[1])[0]
+        # Assign local variables AFTER the initial check ---
+        actual_peak = self._max_daily_load
+        actual_peak_time = self._max_daily_load_time
 
-        if not self._predicted_peak or not self._predicted_peak_time:
-            return
+        # --- Robust Checks Before Calculation ---
+        if actual_peak is None or self._predicted_peak is None:
+            _LOGGER.warning(
+                "Cannot calculate magnitude error: actual_peak (%s) or predicted_peak (%s) is None.",
+                actual_peak, self._predicted_peak
+            )
+            magnitude_error = 0 # Assign a default or skip magnitude bias update
+        else:
+            try:
+                magnitude_error = actual_peak - self._predicted_peak
+            except TypeError as e:
+                _LOGGER.error(
+                    "TypeError calculating magnitude_error (actual=%s, predicted=%s): %s",
+                    actual_peak, self._predicted_peak, e
+                )
+                magnitude_error = 0 # Assign a default
 
-        # Compute errors: time error (in hours) and magnitude error (in MW).
-        time_error = (actual_peak_time - self._predicted_peak_time).total_seconds() / 3600
-        magnitude_error = actual_peak - self._predicted_peak
+        if actual_peak_time is None or self._predicted_peak_time is None:
+            _LOGGER.warning(
+                "Cannot calculate time error: actual_peak_time (%s) or predicted_peak_time (%s) is None.",
+                actual_peak_time, self._predicted_peak_time
+            )
+            time_error = 0 # Assign a default or skip time bias update
+        else:
+            try:
+                # Ensure both are datetime objects before subtraction
+                if isinstance(actual_peak_time, datetime) and isinstance(self._predicted_peak_time, datetime):
+                    time_error = (actual_peak_time - self._predicted_peak_time).total_seconds() / 3600
+                else:
+                    _LOGGER.error("TypeError calculating time_error: Operands are not both datetimes (actual=%s, predicted=%s)", type(actual_peak_time), type(self._predicted_peak_time))
+                    time_error = 0 # Default on type error
+            except TypeError as e: # Catch potential errors during subtraction itself
+                _LOGGER.error(
+                    "TypeError calculating time_error (actual=%s, predicted=%s): %s",
+                    actual_peak_time, self._predicted_peak_time, e
+                )
+                time_error = 0 # Assign a default
+        # --- End Robust Checks ---
 
+
+        # Proceed with history update and bias calculation (using potentially defaulted errors)
         self._time_error_history.append(time_error)
         self._magnitude_error_history.append(magnitude_error)
+        # Check if error_history should track time or magnitude error? Currently magnitude.
         self._error_history.append(magnitude_error)
 
         # Calculate average errors from history.
-        avg_time_error = np.mean(self._time_error_history) if self._time_error_history else 0
-        avg_magnitude_error = np.mean(self._magnitude_error_history) if self._magnitude_error_history else 0
+        avg_time_error = np.mean(list(self._time_error_history)) if self._time_error_history else 0
+        avg_magnitude_error = np.mean(list(self._magnitude_error_history)) if self._magnitude_error_history else 0
 
         # Update adaptive bias factors.
-        self._time_bias -= 0.1 * avg_time_error
-        self._magnitude_bias -= 0.1 * avg_magnitude_error
+        # Only update if the error calculation was likely valid (optional refinement)
+        if time_error != 0 or len(self._time_error_history) == 1:
+            self._time_bias -= 0.1 * avg_time_error
+        if magnitude_error != 0 or len(self._magnitude_error_history) == 1:
+            self._magnitude_bias -= 0.1 * avg_magnitude_error
+
+        # Optional: Add bias clipping here if desired
+        # MAX_TIME_BIAS_HOURS = 2.0
+        # MAX_MAGNITUDE_BIAS_MW = 5000
+        # self._time_bias = max(-MAX_TIME_BIAS_HOURS, min(MAX_TIME_BIAS_HOURS, self._time_bias))
+        # self._magnitude_bias = max(-MAX_MAGNITUDE_BIAS_MW, min(MAX_MAGNITUDE_BIAS_MW, self._magnitude_bias))
+
 
         _LOGGER.info(
-            "Peak occurred: Actual=%.1f MW at %s, Predicted=%.1f MW at %s, "
+            "Peak occurred: Actual=%.1f MW @ %s, Predicted=%.1f MW @ %s, "
             "Time Error=%.2f hrs, Magnitude Error=%.1f MW, "
             "Updated adaptive biases: time_bias=%.2f, magnitude_bias=%.1f",
-            actual_peak, actual_peak_time, self._predicted_peak, self._predicted_peak_time,
+            actual_peak if actual_peak is not None else float('nan'), # Handle None for logging
+            actual_peak_time,
+            self._predicted_peak if self._predicted_peak is not None else float('nan'), # Handle None for logging
+            self._predicted_peak_time,
             time_error, magnitude_error, self._time_bias, self._magnitude_bias
         )
 
@@ -759,21 +961,32 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         """
         if len(self._top_five_peaks) < 5:
             return self._peak_threshold
-        return sorted(self._top_five_peaks, reverse=True)[4]
+        return sorted(self._top_five_peaks, key=lambda x: x[1], reverse=True)[4][1]
+
 
     def _record_daily_peak(self):
         """Record the day's peak load and maintain the top five unique daily peaks."""
         peak_date = self._max_daily_load_time.date()
-        # Check if today's peak already recorded
-        if peak_date in {timestamp.date() for timestamp, _ in self._top_five_peaks}:
-            _LOGGER.debug("Today's peak (%s) already recorded.", peak_date)
-            return
+        updated = False
 
-        # Append and sort
-        self._top_five_peaks.append((self._max_daily_load_time, self._max_daily_load))
+        # Check if today's date is already recorded
+        for i, (ts, val) in enumerate(self._top_five_peaks):
+            if ts.date() == peak_date:
+                if self._max_daily_load > val:
+                    _LOGGER.debug("Updating today's peak from %.1f MW to %.1f MW", val, self._max_daily_load)
+                    self._top_five_peaks[i] = (self._max_daily_load_time, self._max_daily_load)
+                    updated = True
+                else:
+                    _LOGGER.debug("Today's peak (%s) already recorded and current peak %.1f MW is not higher than %.1f MW", peak_date, self._max_daily_load, val)
+                break
+
+        # If not already recorded, add the new peak
+        if not updated and all(ts.date() != peak_date for ts, _ in self._top_five_peaks):
+            _LOGGER.debug("Adding new daily peak for %s: %.1f MW", peak_date, self._max_daily_load)
+            self._top_five_peaks.append((self._max_daily_load_time, self._max_daily_load))
+
+        # Sort and trim the list to the top 5 peaks
         self._top_five_peaks.sort(key=lambda x: x[1], reverse=True)
-
-        # Keep only the top 5 peaks
         if len(self._top_five_peaks) > 5:
             removed_peak = self._top_five_peaks.pop()
             _LOGGER.debug("Removing lowest peak %s", removed_peak)
@@ -1113,3 +1326,4 @@ class PJMData:
         # All retries have been exhausted
         _LOGGER.error("Exhausted retries to get LMP data.")
         return None
+
