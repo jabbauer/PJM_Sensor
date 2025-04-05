@@ -750,47 +750,47 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         # Range: From 0.2 obs weight at 2+ hrs away, up to 0.8 obs weight at 0.5 hrs or less.
         obs_weight = np.clip(1.0 - (time_to_peak_hrs - 0.5) / (2.0 - 0.5), 0.1, 0.9)
         fcst_weight = 1.0 - obs_weight
-        _LOGGER.info(f"Adaptive Blend Weights (time_to_peak={time_to_peak_hrs:.2f} hrs): obs={obs_weight:.2f}, fcst={fcst_weight:.2f}")
+        #_LOGGER.info(f"Adaptive Blend Weights (time_to_peak={time_to_peak_hrs:.2f} hrs): obs={obs_weight:.2f}, fcst={fcst_weight:.2f}")
 
         blended_roc = (obs_weight * self._observed_roc + fcst_weight * self._forecasted_roc) + self._roc_bias
         blended_acc = (obs_weight * self._observed_acc + fcst_weight * self._forecasted_acc) + self._acc_bias
         # --- End Adaptive Blending ---
 
 
-        _LOGGER.info(
-            "Kinematic blended values: blended_roc=%.2f, blended_acc=%.2f",
-            blended_roc, blended_acc
-        )
+        #_LOGGER.info(
+        #    "Kinematic blended values: blended_roc=%.2f, blended_acc=%.2f",
+        #    blended_roc, blended_acc
+        #)
 
         # --- Guard Conditions ---
         if blended_acc == 0:
-            _LOGGER.info("Skipping kinematic: blended_acc is zero.")
+        #    _LOGGER.info("Skipping kinematic: blended_acc is zero.")
             self._kinematic_peak = None; self._kinematic_peak_time = None
             return
         if blended_acc >= 0: # Require deceleration
-            _LOGGER.info("Skipping kinematic: blended_acc (%.2f) is non-negative.", blended_acc)
+        #    _LOGGER.info("Skipping kinematic: blended_acc (%.2f) is non-negative.", blended_acc)
             self._kinematic_peak = None; self._kinematic_peak_time = None
             return
         if abs(blended_acc) < MIN_DECELERATION: # Require minimum deceleration magnitude
-            _LOGGER.info("Skipping kinematic: blended_acc magnitude |%.2f| < threshold %.1f.", blended_acc, MIN_DECELERATION)
+        #    _LOGGER.info("Skipping kinematic: blended_acc magnitude |%.2f| < threshold %.1f.", blended_acc, MIN_DECELERATION)
             self._kinematic_peak = None; self._kinematic_peak_time = None
             return
         # --- End Guards ---
 
         # Calculate raw t_peak
         raw_t_peak = -blended_roc / blended_acc
-        _LOGGER.info("Kinematic raw calculation: raw_t_peak=%.2f hrs", raw_t_peak)
+        #_LOGGER.info("Kinematic raw calculation: raw_t_peak=%.2f hrs", raw_t_peak)
 
         # Apply adaptive time bias
         t_peak = raw_t_peak + self._time_bias
-        _LOGGER.info("Kinematic after time bias: t_peak=%.2f hrs", t_peak)
+        #_LOGGER.info("Kinematic after time bias: t_peak=%.2f hrs", t_peak)
 
         # Check final time validity
         if not (0 < t_peak <= MAX_VALID_PEAK_WINDOW_HRS):
-            _LOGGER.info(
-                "Predicted peak time %.2f hrs (adjusted) invalid or unrealistic (raw: %.2f hrs). Ignoring.",
-                t_peak, raw_t_peak
-            )
+        #    _LOGGER.info(
+        #        "Predicted peak time %.2f hrs (adjusted) invalid or unrealistic (raw: %.2f hrs). Ignoring.",
+        #        t_peak, raw_t_peak
+        #    )
             self._kinematic_peak = None; self._kinematic_peak_time = None
             return
 
@@ -841,7 +841,7 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         # Weighted averaging
         peak_time = sum((p[0].timestamp() * w for p, w in zip(predictions, weights))) / sum(weights)
         peak_magnitude = sum((p[1] * w for p, w in zip(predictions, weights))) / sum(weights)
-        _LOGGER.info("Weighted Average:", peak_magnitude, peak_time)
+        #_LOGGER.info("Weighted Average:", peak_magnitude, peak_time)
         self._predicted_peak_time = datetime.fromtimestamp(peak_time, tz=timezone.utc)
         self._predicted_peak = peak_magnitude
 
@@ -1326,4 +1326,3 @@ class PJMData:
         # All retries have been exhausted
         _LOGGER.error("Exhausted retries to get LMP data.")
         return None
-
