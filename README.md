@@ -1,24 +1,11 @@
-# PJM Sensor - Version 2.1.2
+# PJM Sensor
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Default-orange.svg?style=for-the-badge)](https://github.com/custom-components/hacs)
 
 A Home Assistant integration providing real-time PJM sensor data for monitoring zonal wholesale energy loads, forecasts, and predicting coincident system peaks. This integration leverages PJM's DataMiner 2 API for up-to-date insights.
 
-## What's New in Version 2.1.2
-
-- **Persistent Storage for Peak History:**
-  - Introduced persistent storage for the top five historical peaks, ensuring data continuity across Home Assistant restarts.
-  - Peak history resets annually on October 1st, aligning with PJM's planning year.
- 
-- **Refined Prediction Algorithm:**
-  - Implemented a weighted-average approach combining daily forecasts, short-term forecasts, and real-time kinematic predictions to improve the accuracy of peak forecasts.
-  - Enhanced logic for smoothing the observed rate-of-change (ROC) and acceleration (ACC) values, reducing noise in derivative calculations.
-
-- **Enhanced API Rate Limiting & Retries:**
-  - Improved PJM API interaction with exponential backoff strategies, ensuring robust handling of API rate limits and network errors.
-
-## Bug Fixes:
-- Fixed issues where _get_fifth_highest_peak could cause sensor to malfunction
+## Bug Fixes - 2.1.3:
+- Minor updates to Coincident Peak Prediction Sensor logic to ignore unrealistic predictions 
 
 ## Features
 
