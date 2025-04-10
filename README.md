@@ -4,8 +4,8 @@
 
 A Home Assistant integration providing real-time PJM sensor data for monitoring zonal wholesale energy loads, forecasts, and predicting coincident system peaks. This integration leverages PJM's DataMiner 2 API for up-to-date insights.
 
-## Bug Fixes - 2.1.3:
-- Minor updates to Coincident Peak Prediction Sensor logic to ignore unrealistic predictions 
+## Bug Fixes - 2.1.4:
+- Update to High Risk Day logic to use maximum of 5th highest peak or user configured peak_threshold: Default PJM - 138,000MW, Zone - 17,000MW 
 
 ## Features
 
