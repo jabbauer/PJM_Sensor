@@ -397,14 +397,14 @@ class CoincidentPeakPredictionSensor(SensorEntity):
     def extra_state_attributes(self):
         """Return additional predictive and diagnostic attributes."""
         formatted_top_five_peaks = [
-            f"{timestamp.strftime('%B %d, %Y at %-I:%M:%S %p')} - {load:,.0f}"
+            f"{timestamp.strftime('%B %d, %Y at %-I:%M:%S %p')} - {load:,.0f} MW"
             for timestamp, load in self._top_five_peaks
         ]
-        
+
         return {
             "predicted_peak": self._predicted_peak,
             "predicted_peak_time": (
-                self._predicted_peak_time.isoformat() 
+                self._predicted_peak_time.isoformat()
                 if self._predicted_peak_time else None
             ),
             "peak_hour_active": self._peak_hour_active,
@@ -418,7 +418,7 @@ class CoincidentPeakPredictionSensor(SensorEntity):
             "time_bias": round(self._time_bias, 2),
             "magnitude_bias": round(self._magnitude_bias, 2),
             "error_history": [round(err, 2) for err in self._error_history],
-            "top_five_peaks": "\n".join(formatted_top_five_peaks),
+            "top_five_peaks": formatted_top_five_peaks,
         }
 
     async def async_update(self):
@@ -956,6 +956,19 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         )
 
     def _get_fifth_highest_peak(self):
+        """
+        Determine the effective threshold for high-risk day evaluation based on historical peaks.
+        """
+        if len(self._top_five_peaks) < 5:
+            return self._peak_threshold
+        return max(self._peak_threshold, sorted(self._top_five_peaks, key=lambda x: x[1], reverse=True)[4][1])
+
+        _LOGGER.debug(
+            "_get_fifth_highest_peak: 5 peaks stored. Configured threshold=%.1f, 5th peak load=%.1f. Returning effective threshold: %.1f",
+            self._peak_threshold, fifth_peak_load, effective_threshold
+        )
+        return effective_threshold
+        
         """
         Return the 5th highest peak from the known top peaks or the user-defined threshold if fewer than 5.
         """
