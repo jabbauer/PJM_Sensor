@@ -4,10 +4,6 @@
 
 A Home Assistant integration providing real-time PJM sensor data for monitoring zonal wholesale energy loads, forecasts, and predicting coincident system peaks. This integration leverages PJM's DataMiner 2 API for up-to-date insights.
 
-## Bug Fixes - 2.1.4:
-- Update to High Risk Day logic to use maximum of 5th highest peak or user configured peak_threshold: Default PJM - 138,000MW, Zone - 17,000MW
-- Adjusted def extra_state_attributes to correctly format top five peaks
-
 ## Features
 
 - **Optional API Key:**
@@ -29,6 +25,21 @@ A Home Assistant integration providing real-time PJM sensor data for monitoring 
   - **coincident_peak_prediction_zone** – Coincident Peak Prediction (Zone)
   - **coincident_peak_prediction_system** – Coincident Peak Prediction (System)
 
+- **Coincident Peak Prediction System/Zone Attribute Description:**
+  - **Predicted Peak** – in MW
+  - **Predicted Peak Time** – X
+  - **Observed Peak** – Resets daily
+  - **Observed Peak Time** – Timestamp of Peak
+  - **Peak Hour Active** – 1, during hour of predicted peak, otherwise 0
+  - **High Risk Day** – 1, during day of predicted coincident peak, otherwise 0 (Use for pre-cooling logic, etc on coincident days)
+  - **Observed ROC** – System/Zone 2Hr Load Rate of Change - MW/hr
+  - **Observed ACC** – System/Zone 2Hr Load Acceleration - MW/hr^2
+  - **Forecasted ROC** – System/Zone 2Hr Forecast Rate of Change - MW/hr
+  - **Forecasted ACC** – System/Zone 2Hr Forecast Acceleration - MW/hr^2
+  - **Bias roc/acc/time** - Future - Error measurement for forecast adjustments
+  - **Error History** - Future - Error measurement for forecast adjustments
+  - **Top Five Peaks** - Tracks Coincident Peaks (Date/time - MW)
+
 > **Note:** Data from PJM's DataMiner 2 API is for internal use only. Redistribution of this data or any derivative information is prohibited unless you are a PJM member.
 
 ## Installation
@@ -47,6 +58,13 @@ A Home Assistant integration providing real-time PJM sensor data for monitoring 
    - **Choose the sensor entities** you want to enable.
      - By default, **instantaneous_total_load**, **total_short_forecast**, and **total_load_forecast** are selected.
      - Without an API key, only up to 3 sensors can be selected.
+
+## Bug Fixes - 2.1.5:
+- Increased history buffer lengths, 12 to 36
+- Lower smoothing constant, 0.3 to 0.2
+- Adjusted Kinematic Prediction Thresholds, 50 to 25
+- Adjusted logging for debugging purposes
+- Additional extra_state_attributes added
 
 ## Disclaimer
 
