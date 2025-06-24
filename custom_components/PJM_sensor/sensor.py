@@ -219,7 +219,7 @@ class PJMSensor(SensorEntity):
         # 2) Append to a rolling history
         now_utc = datetime.now(timezone.utc)
         if not hasattr(self, "_load_history"):
-            self._load_history = deque(maxlen=12)  # ~ 1 hour if each update is 5 min
+            self._load_history = deque(maxlen=36)  # ~ 1 hour if each update is 5 min
         self._load_history.append((now_utc, load))
 
         # 3) Compute derivative over this 1-hour window
@@ -306,7 +306,7 @@ class CoincidentPeakPredictionSensor(SensorEntity):
     """
     ACCELERATION_THRESHOLD = 500  # MW/hr², easy to adjust centrally
     MAX_VALID_PEAK_WINDOW = 3    # hours
-    SMOOTHING_ALPHA = 0.3  # between 0 (more smoothing) and 1 (less smoothing)
+    SMOOTHING_ALPHA = 0.2  # between 0 (more smoothing) and 1 (less smoothing)
 
     def __init__(self, pjm_data, zone, peak_threshold, accuracy_threshold, sensor_type, hass):
         super().__init__()
@@ -322,7 +322,7 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         self._state = None
         
         # Rolling load history (timestamp, load) for derivative calculations (~1-2 hours)
-        self._load_history = deque(maxlen=12)
+        self._load_history = deque(maxlen=36)
         
         # Forecast update trackers
         self._last_daily_forecast_update = None
@@ -406,6 +406,11 @@ class CoincidentPeakPredictionSensor(SensorEntity):
             "predicted_peak_time": (
                 self._predicted_peak_time.isoformat()
                 if self._predicted_peak_time else None
+            ),
+            "observed_peak": self._max_daily_load,
+            "observed_peak_time": (
+                self._max_daily_load_time.isoformat()
+                if self._max_daily_load_time else None
             ),
             "peak_hour_active": self._peak_hour_active,
             "high_risk_day": self._high_risk_day,
@@ -577,7 +582,7 @@ class CoincidentPeakPredictionSensor(SensorEntity):
 
         # Store ROC in history for ACC calculation
         if not hasattr(self, '_roc_history'):
-            self._roc_history = deque(maxlen=12)
+            self._roc_history = deque(maxlen=36)
         self._roc_history.append((sorted_history[-1][0], self._observed_roc))
 
         # Compute acceleration (ACC)
@@ -721,7 +726,7 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         """
         # Thresholds and constants
         ACCELERATION_THRESHOLD = 50  # Min abs acceleration magnitude (MW/hr²) - TUNE THIS
-        MIN_DECELERATION = 50       # Min abs negative acceleration (MW/hr²) - TUNE THIS
+        MIN_DECELERATION = 25       # Min abs negative acceleration (MW/hr²) - TUNE THIS
         MAX_VALID_PEAK_WINDOW_HRS = 4 # Max hours ahead for valid prediction
 
         _LOGGER.info( # Log raw inputs once
