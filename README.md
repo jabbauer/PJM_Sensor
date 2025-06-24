@@ -27,7 +27,7 @@ A Home Assistant integration providing real-time PJM sensor data for monitoring 
 
 - **Coincident Peak Prediction System/Zone Attribute Description:**
   - **Predicted Peak** – in MW
-  - **Predicted Peak Time** – X
+  - **Predicted Peak Time** – Timestamp of Peak
   - **Observed Peak** – Resets daily
   - **Observed Peak Time** – Timestamp of Peak
   - **Peak Hour Active** – 1, during hour of predicted peak, otherwise 0
