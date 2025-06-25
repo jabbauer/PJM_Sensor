@@ -31,7 +31,9 @@ A Home Assistant integration providing real-time PJM sensor data for monitoring 
   - **Observed Peak** – Resets daily
   - **Observed Peak Time** – Timestamp of Peak
   - **Peak Hour Active** – 1, during hour of predicted peak, otherwise 0
-  - **High Risk Day** – 1, during day of predicted coincident peak, otherwise 0 (Use for pre-cooling logic, etc on coincident days)
+    - Use for triggering curtailment on coincident days
+  - **High Risk Day** – 1, during day of predicted coincident peak, otherwise 0
+    - Use for pre-cooling logic on coincident days
   - **Observed ROC** – System/Zone 2Hr Load Rate of Change - MW/hr
   - **Observed ACC** – System/Zone 2Hr Load Acceleration - MW/hr^2
   - **Forecasted ROC** – System/Zone 2Hr Forecast Rate of Change - MW/hr
@@ -54,10 +56,11 @@ A Home Assistant integration providing real-time PJM sensor data for monitoring 
 6. Navigate to **Settings > Devices & Services** and add the **PJM Sensor** integration.
 7. In the configuration flow:
    - **Select your utility zone.**
-   - **Enter your API key** (optional). Without an API key, the integration fetches the subscription key but limits you to 3 sensors.
+   - **Enter your API key** (optional). Without an API key, you may become IP banned by PJM. Utilize for initial testing only.
    - **Choose the sensor entities** you want to enable.
      - By default, **instantaneous_total_load**, **total_short_forecast**, and **total_load_forecast** are selected.
      - Without an API key, only up to 3 sensors can be selected.
+     - Per PJM, Non-members may not exceed 6 data connections per minute.
 
 ## Bug Fixes - 2.1.5:
 - Increased history buffer lengths, 12 to 36
