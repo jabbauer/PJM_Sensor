@@ -32,7 +32,7 @@ A Home Assistant integration providing real-time PJM sensor data for monitoring 
   - **Observed Peak Time** – Timestamp of Peak
   - **Peak Hour Active** – 1, during hour of predicted peak, otherwise 0
     - Use for triggering curtailment on coincident days
-  - **High Risk Day** – 1, during day of predicted coincident peak, otherwise 0
+  - **High Risk Day** – True, during day of predicted coincident peak - enabled at 95% of 5CP or peak_threshold
     - Use for pre-cooling logic on coincident days
   - **Observed ROC** – System/Zone 2Hr Load Rate of Change - MW/hr
   - **Observed ACC** – System/Zone 2Hr Load Acceleration - MW/hr^2
@@ -41,6 +41,10 @@ A Home Assistant integration providing real-time PJM sensor data for monitoring 
   - **Bias roc/acc/time** - Future - Error measurement for forecast adjustments
   - **Error History** - Future - Error measurement for forecast adjustments
   - **Top Five Peaks** - Tracks Coincident Peaks (Date/time - MW)
+
+- **Coincident Peak Prediction System/Zone Other Settings**
+  - **peak_threshold_zone/system** – Minimum for High Risk Day Checks - Predictions below this value are ignored
+  - **accuracy_threshold** - Future
 
 > **Note:** Data from PJM's DataMiner 2 API is for internal use only. Redistribution of this data or any derivative information is prohibited unless you are a PJM member.
 
