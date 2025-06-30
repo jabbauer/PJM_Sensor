@@ -102,6 +102,8 @@ This integration uses PJM’s DataMiner 2 API to provide live and forecasted ins
         entity_id: climate.house
       data:
         temperature: 78
+```
+
 
 ## Changelog - 2.1.5:
 - Increased history buffer lengths, 12 to 36
