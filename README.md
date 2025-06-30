@@ -59,14 +59,12 @@ This integration uses PJM’s DataMiner 2 API to provide live and forecasted ins
 
 ### 🔑 API Key Behavior
 
-PJM enforces a request limit of 6 per minute for anonymous users.
-
 - **With API Key**:
   - Full access to all sensors
   - Non-members may not exceed 6 data connections per minute
 - **Without API Key**:
   - Limited to 3 sensor entities
-  - Best for evaluation or testing only
+  - For evaluation or testing only
   - Risk of IP ban
 
 ---
