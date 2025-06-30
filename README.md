@@ -26,7 +26,7 @@ This integration uses PJM’s DataMiner 2 API to provide live and forecasted ins
   - 2-hour and daily forecasts
   - Kinematic modeling (quadratic) with adaptive time and magnitude biasing
 - Tracks and stores the **top five daily peaks** across the season
-- Designed to support **5CP/ICAP tag management** or load curtailment strategies
+- Designed to support **5CP Capacity PLC and Network Service PLC management** or load curtailment strategies
 
 #### Exposed Attributes:
 | Attribute | Description |
