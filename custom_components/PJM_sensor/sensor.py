@@ -317,6 +317,7 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         self._attr_name = f"Coincident Peak Prediction ({zone})"
         self._attr_unique_id = f"pjm_{sensor_type}_{zone}"
         self._unit_of_measurement = "MW"
+        self._last_reset_date = date.today()
         
         # The main sensor state is the current instantaneous load.
         self._state = None
