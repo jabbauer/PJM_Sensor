@@ -105,12 +105,8 @@ This integration uses PJM’s DataMiner 2 API to provide live and forecasted ins
 ```
 
 
-## Changelog - 2.1.5:
-- Increased history buffer lengths, 12 to 36
-- Lower smoothing constant, 0.3 to 0.2
-- Adjusted Kinematic Prediction Thresholds, 50 to 25
-- Adjusted logging for debugging purposes
-- Additional extra_state_attributes added
+## Changelog - 2.1.6:
+- Fixed: Resolved AttributeError: '_last_reset_date' crash on startup by initializing peak history dates immediately.
 
 ## Disclaimer
 
