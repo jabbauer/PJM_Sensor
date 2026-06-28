@@ -481,17 +481,21 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         # 3. Refine predictions if the daily peak has not occurred.
         await self._maybe_update_forecasts(now)
 
-        # 4. Run Kinematics if within 1.5 hours of Predicted Peak, Short Forecast and load recently updated
+        # 4. Run Kinematics when within ~3 hours, but with stronger safeguards
         if not self._daily_peak_occurred:
             time_to_peak = (self._predicted_peak_time - now) if self._predicted_peak_time else None
-            recently_updated = (self._last_short_forecast_update and (now - self._last_short_forecast_update < timedelta(minutes=10))) and \
-                            (self._last_load_update and (now - self._last_load_update < timedelta(minutes=10)))
+            recently_updated = (self._last_short_forecast_update and 
+                            (now - self._last_short_forecast_update < timedelta(minutes=10))) and \
+                            (self._last_load_update and 
+                            (now - self._last_load_update < timedelta(minutes=10)))
 
-            if (time_to_peak and time_to_peak <= timedelta(minutes=110) and recently_updated):
+            if (time_to_peak and time_to_peak <= timedelta(hours=3.25) and recently_updated):
                 if not self._last_kinematics_update or (now - self._last_kinematics_update >= timedelta(minutes=5)):
-                    self._predict_peak_using_kinematics(now)
-                    self._last_kinematics_update = now
-                    self._weighted_peak_prediction()
+                    # Only run kinematics if we have decent short forecast data
+                    if self._forecasted_acc is not None and self._forecasted_acc < -20:
+                        self._predict_peak_using_kinematics(now)
+                        self._last_kinematics_update = now
+                        self._weighted_peak_prediction()
         
         # Check real-time load exceedance
         if self._state and self._predicted_peak and self._state > self._predicted_peak:
@@ -726,7 +730,6 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         Applies adaptive blending based on time_to_peak.
         """
         # Thresholds and constants
-        ACCELERATION_THRESHOLD = 50  # Min abs acceleration magnitude (MW/hr²) - TUNE THIS
         MIN_DECELERATION = 25       # Min abs negative acceleration (MW/hr²) - TUNE THIS
         MAX_VALID_PEAK_WINDOW_HRS = 4 # Max hours ahead for valid prediction
 
@@ -737,79 +740,53 @@ class CoincidentPeakPredictionSensor(SensorEntity):
             self._forecasted_roc, self._forecasted_acc, self._roc_bias, self._acc_bias
         )
 
-        # Check if forecast derivatives are available
-        if self._forecasted_roc == 0 and self._forecasted_acc == 0: # Allow if only one is zero maybe?
-            _LOGGER.info("Skipping kinematic: Forecasted ROC/ACC insufficient.")
-            self._kinematic_peak = None; self._kinematic_peak_time = None
+        if self._state is None:
             return
 
-        # --- Adaptive Blending ---
-        time_to_peak_hrs = float('inf') # Default to infinity if no prediction yet
+        # --- Time to peak awareness ---
+        time_to_peak_hrs = float('inf')
         if self._predicted_peak_time:
             time_diff_sec = (self._predicted_peak_time - now).total_seconds()
-            if time_diff_sec > 0: # Only consider future predicted peaks
+            if time_diff_sec > 0:
                 time_to_peak_hrs = time_diff_sec / 3600.0
 
-        # Define weighting function (linear ramp example)
-        # Weight shifts towards observed data as predicted time approaches.
-        # obs_weight = 1.0 means fully observed, 0.0 means fully forecast.
-        # Range: From 0.2 obs weight at 2+ hrs away, up to 0.8 obs weight at 0.5 hrs or less.
-        obs_weight = np.clip(1.0 - (time_to_peak_hrs - 0.5) / (2.0 - 0.5), 0.1, 0.9)
+        # --- Adaptive Blending with stronger forecast weight early ---
+        obs_weight = np.clip(1.0 - (time_to_peak_hrs - 0.5) / (2.5 - 0.5), 0.15, 0.85)
         fcst_weight = 1.0 - obs_weight
-        #_LOGGER.info(f"Adaptive Blend Weights (time_to_peak={time_to_peak_hrs:.2f} hrs): obs={obs_weight:.2f}, fcst={fcst_weight:.2f}")
 
         blended_roc = (obs_weight * self._observed_roc + fcst_weight * self._forecasted_roc) + self._roc_bias
         blended_acc = (obs_weight * self._observed_acc + fcst_weight * self._forecasted_acc) + self._acc_bias
-        # --- End Adaptive Blending ---
 
-
-        #_LOGGER.info(
-        #    "Kinematic blended values: blended_roc=%.2f, blended_acc=%.2f",
-        #    blended_roc, blended_acc
-        #)
-
-        # --- Guard Conditions ---
+        # --- Improved Guard Conditions ---
         if blended_acc == 0:
-        #    _LOGGER.info("Skipping kinematic: blended_acc is zero.")
-            self._kinematic_peak = None; self._kinematic_peak_time = None
+            self._kinematic_peak = None
+            self._kinematic_peak_time = None
             return
-        if blended_acc >= 0: # Require deceleration
-        #    _LOGGER.info("Skipping kinematic: blended_acc (%.2f) is non-negative.", blended_acc)
-            self._kinematic_peak = None; self._kinematic_peak_time = None
-            return
-        if abs(blended_acc) < MIN_DECELERATION: # Require minimum deceleration magnitude
-        #    _LOGGER.info("Skipping kinematic: blended_acc magnitude |%.2f| < threshold %.1f.", blended_acc, MIN_DECELERATION)
-            self._kinematic_peak = None; self._kinematic_peak_time = None
-            return
-        # --- End Guards ---
 
-        # Calculate raw t_peak
+        # Relax guard when we have good short forecast support (key improvement)
+        effective_min_dec = MIN_DECELERATION
+        if (self._forecasted_acc is not None and 
+            self._forecasted_acc < -30 and time_to_peak_hrs > 1.0):
+            effective_min_dec = 12
+
+        if blended_acc >= 0 or abs(blended_acc) < effective_min_dec:
+            self._kinematic_peak = None
+            self._kinematic_peak_time = None
+            return
+
+        # --- Core Kinematic Calculation ---
         raw_t_peak = -blended_roc / blended_acc
-        #_LOGGER.info("Kinematic raw calculation: raw_t_peak=%.2f hrs", raw_t_peak)
-
-        # Apply adaptive time bias
         t_peak = raw_t_peak + self._time_bias
-        #_LOGGER.info("Kinematic after time bias: t_peak=%.2f hrs", t_peak)
 
-        # Check final time validity
         if not (0 < t_peak <= MAX_VALID_PEAK_WINDOW_HRS):
-        #    _LOGGER.info(
-        #        "Predicted peak time %.2f hrs (adjusted) invalid or unrealistic (raw: %.2f hrs). Ignoring.",
-        #        t_peak, raw_t_peak
-        #    )
-            self._kinematic_peak = None; self._kinematic_peak_time = None
+            self._kinematic_peak = None
+            self._kinematic_peak_time = None
             return
 
-        # Calculate predicted load using blended values and adjusted time
-        if self._state is None: # Need current load for prediction
-            _LOGGER.warning("Skipping kinematic load calculation: current state is None.")
-            self._kinematic_peak = None; self._kinematic_peak_time = None
-            return
-            
+        # Predict load
         predicted_load = self._state + blended_roc * t_peak + 0.5 * blended_acc * (t_peak ** 2)
         predicted_load += self._magnitude_bias
 
-        # Update kinematic state
         self._kinematic_peak = int(round(predicted_load))
         self._kinematic_peak_time = now + timedelta(hours=t_peak)
 
