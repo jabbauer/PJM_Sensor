@@ -71,3 +71,6 @@ SENSOR_TYPES = {
     CONF_COINCIDENT_PEAK_PREDICTION_ZONE: ["Coincident Peak Prediction (Zone)", "MW"],
     CONF_COINCIDENT_PEAK_PREDICTION_SYSTEM: ["Coincident Peak Prediction (System)", "MW"],
 }
+
+# Integration version for bias store compatibility checking
+INTEGRATION_VERSION = "2.1.6"
