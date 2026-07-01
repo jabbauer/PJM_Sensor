@@ -51,6 +51,7 @@ from .const import (
     DEFAULT_ACCURACY_THRESHOLD,
     ZONE_TO_PNODE_ID,
     SENSOR_TYPES,
+    INTEGRATION_VERSION,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -364,8 +365,14 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         self._store = Store(hass, 1, f"coincident_peaks_{zone}.json")
         self._top_five_peaks = []
 
+        # NEW: Separate persistent store for bias learning (versioned)
+        self._bias_store = Store(hass, 1, f"coincident_peak_bias_{zone}.json")
+        self._bias_version = INTEGRATION_VERSION
+
         # Load peaks from storage
         self.hass.async_create_task(self._async_load_peaks())
+        #Load biases from storage (with version check)
+        self.hass.async_create_task(self._async_load_biases())
 
         # Flags and thresholds
         self._daily_peak_occurred = False
@@ -850,93 +857,88 @@ class CoincidentPeakPredictionSensor(SensorEntity):
 
     def _record_error_and_update_bias(self):
         """
-        After the peak has passed, compare the actual peak load (from recent history)
-        with the predicted peak load. Record the error and adjust bias factors accordingly.
+        After the peak has passed, compare the actual peak load with the predicted peak.
+        Uses forecast-based logarithmic weighting so high-risk / 5CP days influence learning more.
+        Includes safety checks and caps on bias values.
         """
-        # Initial check: Make sure the necessary source attributes are present
+        # === Initial Guard ===
         if not self._max_daily_load or not self._predicted_peak or not self._predicted_peak_time:
-            # Changed level to DEBUG as this is normal operation if conditions not met
-            _LOGGER.debug("Skipping error recording: Missing max_daily_load, predicted_peak, or predicted_peak_time.")
+            _LOGGER.debug("Skipping bias update: Missing max_daily_load, predicted_peak, or predicted_peak_time.")
             return
 
-        # Assign local variables AFTER the initial check ---
         actual_peak = self._max_daily_load
         actual_peak_time = self._max_daily_load_time
 
-        # --- Robust Checks Before Calculation ---
+        # === Safe Magnitude Error Calculation ===
         if actual_peak is None or self._predicted_peak is None:
-            _LOGGER.warning(
-                "Cannot calculate magnitude error: actual_peak (%s) or predicted_peak (%s) is None.",
-                actual_peak, self._predicted_peak
-            )
-            magnitude_error = 0 # Assign a default or skip magnitude bias update
+            _LOGGER.warning("Cannot calculate magnitude error — one of the values is None.")
+            magnitude_error = 0.0
         else:
             try:
-                magnitude_error = actual_peak - self._predicted_peak
-            except TypeError as e:
-                _LOGGER.error(
-                    "TypeError calculating magnitude_error (actual=%s, predicted=%s): %s",
-                    actual_peak, self._predicted_peak, e
-                )
-                magnitude_error = 0 # Assign a default
+                magnitude_error = float(actual_peak) - float(self._predicted_peak)
+            except (TypeError, ValueError) as e:
+                _LOGGER.error("Error calculating magnitude_error: %s", e)
+                magnitude_error = 0.0
 
+        # === Safe Time Error Calculation ===
         if actual_peak_time is None or self._predicted_peak_time is None:
-            _LOGGER.warning(
-                "Cannot calculate time error: actual_peak_time (%s) or predicted_peak_time (%s) is None.",
-                actual_peak_time, self._predicted_peak_time
-            )
-            time_error = 0 # Assign a default or skip time bias update
+            _LOGGER.warning("Cannot calculate time error — one of the datetime values is None.")
+            time_error = 0.0
         else:
             try:
-                # Ensure both are datetime objects before subtraction
                 if isinstance(actual_peak_time, datetime) and isinstance(self._predicted_peak_time, datetime):
-                    time_error = (actual_peak_time - self._predicted_peak_time).total_seconds() / 3600
+                    time_error = (actual_peak_time - self._predicted_peak_time).total_seconds() / 3600.0
                 else:
-                    _LOGGER.error("TypeError calculating time_error: Operands are not both datetimes (actual=%s, predicted=%s)", type(actual_peak_time), type(self._predicted_peak_time))
-                    time_error = 0 # Default on type error
-            except TypeError as e: # Catch potential errors during subtraction itself
-                _LOGGER.error(
-                    "TypeError calculating time_error (actual=%s, predicted=%s): %s",
-                    actual_peak_time, self._predicted_peak_time, e
-                )
-                time_error = 0 # Assign a default
-        # --- End Robust Checks ---
+                    _LOGGER.error("Time error calculation failed — values are not both datetime objects.")
+                    time_error = 0.0
+            except Exception as e:
+                _LOGGER.error("Unexpected error calculating time_error: %s", e)
+                time_error = 0.0
 
+        # === NEW: Forecast-based Logarithmic Weighting ===
+        forecast_peak = getattr(self, '_daily_forecast_peak', None) or self._predicted_peak or 0
+        fifth_peak = self._get_fifth_highest_peak()
 
-        # Proceed with history update and bias calculation (using potentially defaulted errors)
-        self._time_error_history.append(time_error)
-        self._magnitude_error_history.append(magnitude_error)
-        # Check if error_history should track time or magnitude error? Currently magnitude.
+        if fifth_peak > 0 and forecast_peak > 0:
+            ratio = forecast_peak / fifth_peak
+            if ratio <= 0.94:          # Below ~140k MW
+                weight = 0.35
+            else:
+                # Log curve with strong emphasis on true high/5CP days
+                weight = 0.35 + 4.5 * np.log1p(8 * (ratio - 0.94))
+        else:
+            weight = 0.35
+
+        weight = max(0.35, min(5.0, weight))
+
+        # Apply weighted errors
+        self._time_error_history.append(time_error * weight)
+        self._magnitude_error_history.append(magnitude_error * weight)
         self._error_history.append(magnitude_error)
 
-        # Calculate average errors from history.
-        avg_time_error = np.mean(list(self._time_error_history)) if self._time_error_history else 0
-        avg_magnitude_error = np.mean(list(self._magnitude_error_history)) if self._magnitude_error_history else 0
+        # Calculate averages from history
+        avg_time_error = np.mean(list(self._time_error_history)) if self._time_error_history else 0.0
+        avg_magnitude_error = np.mean(list(self._magnitude_error_history)) if self._magnitude_error_history else 0.0
 
-        # Update adaptive bias factors.
-        # Only update if the error calculation was likely valid (optional refinement)
+        # === Update Biases with Caps ===
         if time_error != 0 or len(self._time_error_history) == 1:
-            self._time_bias -= 0.1 * avg_time_error
+            self._time_bias += 0.1 * avg_time_error
+            self._time_bias = max(-1.0, min(1.0, self._time_bias))      # ±1.0 hour cap
+
         if magnitude_error != 0 or len(self._magnitude_error_history) == 1:
-            self._magnitude_bias -= 0.1 * avg_magnitude_error
-
-        # Optional: Add bias clipping here if desired
-        # MAX_TIME_BIAS_HOURS = 2.0
-        # MAX_MAGNITUDE_BIAS_MW = 5000
-        # self._time_bias = max(-MAX_TIME_BIAS_HOURS, min(MAX_TIME_BIAS_HOURS, self._time_bias))
-        # self._magnitude_bias = max(-MAX_MAGNITUDE_BIAS_MW, min(MAX_MAGNITUDE_BIAS_MW, self._magnitude_bias))
-
+            self._magnitude_bias += 0.1 * avg_magnitude_error
+            self._magnitude_bias = max(-5000, min(5000, self._magnitude_bias))  # ±5000 MW cap
 
         _LOGGER.info(
-            "Peak occurred: Actual=%.1f MW @ %s, Predicted=%.1f MW @ %s, "
-            "Time Error=%.2f hrs, Magnitude Error=%.1f MW, "
-            "Updated adaptive biases: time_bias=%.2f, magnitude_bias=%.1f",
-            actual_peak if actual_peak is not None else float('nan'), # Handle None for logging
-            actual_peak_time,
-            self._predicted_peak if self._predicted_peak is not None else float('nan'), # Handle None for logging
-            self._predicted_peak_time,
-            time_error, magnitude_error, self._time_bias, self._magnitude_bias
+            "Bias update (weight=%.2f): Actual=%.0f MW, Predicted=%.0f MW, "
+            "Time Error=%.2f hrs, Mag Error=%.0f MW → time_bias=%.2f, magnitude_bias=%.0f",
+            weight, actual_peak, self._predicted_peak,
+            time_error, magnitude_error,
+            self._time_bias, self._magnitude_bias
         )
+
+        # Persist biases
+        self.hass.async_create_task(self._async_save_biases())
 
     def _get_fifth_highest_peak(self):
         """
@@ -1038,6 +1040,32 @@ class CoincidentPeakPredictionSensor(SensorEntity):
         await self._store.async_save({
             'top_five_peaks': self._top_five_peaks,
             'last_reset_date': self._last_reset_date.isoformat(),
+        })
+
+    async def _async_load_biases(self):
+        """Load bias values and histories from persistent storage with version check."""
+        data = await self._bias_store.async_load()
+        if data and data.get("version") == self._bias_version:
+            self._time_bias = data.get("time_bias", 0.0)
+            self._magnitude_bias = data.get("magnitude_bias", 0.0)
+            self._time_error_history = deque(data.get("time_error_history", []), maxlen=30)
+            self._magnitude_error_history = deque(data.get("magnitude_error_history", []), maxlen=30)
+            _LOGGER.info("Loaded persisted biases (version %s)", self._bias_version)
+        else:
+            _LOGGER.info("Bias store version mismatch or empty. Starting with fresh biases.")
+            self._time_bias = 0.0
+            self._magnitude_bias = 0.0
+            self._time_error_history.clear()
+            self._magnitude_error_history.clear()
+
+    async def _async_save_biases(self):
+        """Save current bias values and histories to persistent storage."""
+        await self._bias_store.async_save({
+            "version": self._bias_version,
+            "time_bias": self._time_bias,
+            "magnitude_bias": self._magnitude_bias,
+            "time_error_history": list(self._time_error_history),
+            "magnitude_error_history": list(self._magnitude_error_history),
         })
 
 class PJMData:
