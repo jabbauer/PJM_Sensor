@@ -1,0 +1,68 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "PJM Sensor",
+        "description": "Choose sensors and thresholds. Secure keeps the existing conservative policy; Intermediate permits conditional two-hour coverage; Reliable permits up to three clock hours but still obeys your elapsed-time cap (120 minutes by default). Experimental diagnostics do not control production curtailment.",
+        "data": {
+          "zone": "PJM zone",
+          "api_key": "PJM subscription key (optional)",
+          "instantaneous_total_load": "System instantaneous load",
+          "total_short_forecast": "System two-hour forecast",
+          "total_load_forecast": "System daily forecast",
+          "instantaneous_zone_load": "Zonal instantaneous load",
+          "zone_short_forecast": "Zonal two-hour forecast",
+          "zone_load_forecast": "Zonal daily forecast",
+          "zonal_lmp": "Real-time zonal LMP",
+          "da_hrl_lmp": "Day-ahead hourly LMP",
+          "coincident_peak_prediction_zone": "Zonal coincident-peak prediction",
+          "coincident_peak_prediction_system": "System coincident-peak prediction",
+          "peak_threshold_zone": "Zonal peak threshold (MW)",
+          "peak_threshold_system": "System peak threshold (MW)",
+          "accuracy_threshold": "Accuracy threshold",
+          "cover_mode": "Cover mode: secure, intermediate, or reliable",
+          "max_daily_curtailment_minutes": "Maximum daily curtailment minutes (1–180)",
+          "experimental_coincident_logic": "Enable experimental shadow diagnostics"
+        }
+      }
+    },
+    "error": {
+      "no_sensors_selected": "Select at least one sensor.",
+      "max_sensors_exceeded_without_api_key": "Without your own subscription key, select at most three sensors.",
+      "unsupported_da_zone": "Day-ahead prices require a supported transmission zone, such as COMED; PJM-RTO is not supported."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "PJM Sensor options",
+        "description": "Choose sensors and thresholds. Secure keeps the existing conservative policy; Intermediate permits conditional two-hour coverage; Reliable permits up to three clock hours but still obeys your elapsed-time cap (120 minutes by default). Experimental diagnostics do not control production curtailment.",
+        "data": {
+          "zone": "PJM zone",
+          "api_key": "PJM subscription key (optional)",
+          "instantaneous_total_load": "System instantaneous load",
+          "total_short_forecast": "System two-hour forecast",
+          "total_load_forecast": "System daily forecast",
+          "instantaneous_zone_load": "Zonal instantaneous load",
+          "zone_short_forecast": "Zonal two-hour forecast",
+          "zone_load_forecast": "Zonal daily forecast",
+          "zonal_lmp": "Real-time zonal LMP",
+          "da_hrl_lmp": "Day-ahead hourly LMP",
+          "coincident_peak_prediction_zone": "Zonal coincident-peak prediction",
+          "coincident_peak_prediction_system": "System coincident-peak prediction",
+          "peak_threshold_zone": "Zonal peak threshold (MW)",
+          "peak_threshold_system": "System peak threshold (MW)",
+          "accuracy_threshold": "Accuracy threshold",
+          "cover_mode": "Cover mode: secure, intermediate, or reliable",
+          "max_daily_curtailment_minutes": "Maximum daily curtailment minutes (1–180)",
+          "experimental_coincident_logic": "Enable experimental shadow diagnostics"
+        }
+      }
+    },
+    "error": {
+      "no_sensors_selected": "Select at least one sensor.",
+      "max_sensors_exceeded_without_api_key": "Without your own subscription key, select at most three sensors.",
+      "unsupported_da_zone": "Day-ahead prices require a supported transmission zone, such as COMED; PJM-RTO is not supported."
+    }
+  }
+}
