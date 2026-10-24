@@ -1,232 +1,75 @@
 # PJM Sensor
 
-[![hacs_badge](https://img.shields.io/badge/HACS-Default-orange.svg?style=for-the-badge)](https://github.com/custom-components/hacs)
+**Version 2.3.1** — PJM grid load, load forecasts, coincident-peak predictions, and zonal electricity prices for Home Assistant.
 
-A Home Assistant integration providing real-time PJM sensor data for monitoring zonal wholesale energy loads, forecasts, and predicting coincident system peaks. This integration leverages PJM's DataMiner 2 API for up-to-date insights.
-
-**Version 2.2.0** upgrades coincident-peak curtailment control to **Cover5CP** (prefer on-hour arming with 5CP cover safety). Integration build tag: `grok_cover5cp_rc1`.
-
----
-
-## Features
-
-This integration uses PJM’s DataMiner 2 API to provide live and forecasted insight into grid conditions. It supports both basic monitoring and advanced predictive capabilities.
-
-### 🔄 Real-Time & Forecast Load Sensors
-
-- **System Load**: PJM-wide real-time load (updated every 5 minutes)
-- **System Forecasts**:
-  - 2-hour forecast (updated every 5 minutes)
-  - Daily forecast (updated hourly)
-- **Zonal Load & Forecasts**: Instantaneous and forecasted values for your selected PJM zone
-- **Zonal LMP**: Hourly average Locational Marginal Price (LMP) for your zone
-
-### 🔮 Coincident Peak Prediction (System & Zone)
-
-- Predicts daily system or zonal peak load time and magnitude using:
-  - Real-time derivative analysis (rate of change, acceleration)
-  - 2-hour and daily forecasts
-  - Kinematic modeling with adaptive time and magnitude biasing
-- Tracks and stores the **top five daily peaks** across the season
-- Designed to support **5CP Capacity PLC and Network Service PLC management** or load curtailment strategies
-
-#### Cover5CP peak-hour control (2.2.0)
-
-On **high-risk days**, `peak_hour_active` is driven by **Cover5CP**:
-
-- Prefer first arm on the true peak hour (official “good” / armOK)
-- Cover safety: first arm aimed at `[actual−2, actual]` peak hours (avoid late/miss)
-- Sticky high-risk once seen (forecast drop mid-day does not un-arm cover)
-- Single-hour active after first arm (limits hard false-positive multi-hour arms)
-- Operational lock (hr90 path-A) can re-hit the true peak hour after lock engages
-- Post-peak freeze: stop refine/arm when afternoon peak reference is more than **2 hours** past (reboot-safe; no fixed 8 PM cutoff)
-
-High-risk latch (tighter than 2.1.x):
-
-- `predicted_peak ≥ 0.98 × max(configured threshold, 5th-highest stored peak)` when five peaks are stored  
-- Was **0.95** in 2.1.x (more false high-risk days)
-
-#### Exposed Attributes
-
-| Attribute | Description |
-|----------|-------------|
-| `predicted_peak` | Forecasted load in MW |
-| `predicted_peak_time` | Timestamp of predicted peak |
-| `observed_peak` | Highest observed real-time load today |
-| `observed_peak_time` | Timestamp of observed peak |
-| `peak_hour_active` | `true` during Cover5CP active curtailment window (high-risk days) |
-| `high_risk_day` | `true` if day meets the high-risk latch (see above) |
-| `saw_high_risk` | `true` if high-risk was seen earlier today (sticky) |
-| `cover5cp_armed` | `true` after first Cover5CP arm today |
-| `cover5cp_first_arm_h` | Local hour of first arm (diagnostics) |
-| `cover5cp_peak_hint_max` | Running latest peak-hour hint (diagnostics) |
-| `prediction_time_locked` | Operational lock engaged |
-| `integration_version` | Build tag (e.g. `grok_cover5cp_rc1`) |
-| `observed_roc` / `observed_acc` | Real-time load rate-of-change and acceleration |
-| `forecasted_roc` / `forecasted_acc` | Forecasted load rate-of-change and acceleration |
-| `time_bias`, `magnitude_bias` | Adaptive corrections from snapshot vs actual learning |
-| `top_five_peaks` | List of the top five daily peaks observed this season |
-
-> All timestamps are in ISO 8601 format and localized to your Home Assistant instance's time zone.
-
----
-
-### ⚙️ Configuration Settings
-
-- `peak_threshold_zone` / `peak_threshold_system`  
-  Minimum load (in MW) for the high-risk bar (combined with 5th historical peak).  
-  Defaults (2.2.0): **18,000** (zone), **150,000** (system) — aligned with 2026 summer peak levels (was 17k / 138k).
-
-- `accuracy_threshold`  
-  *(Reserved for future use.)* Intended for evaluating forecast confidence before triggering peak alerts.
-
----
-
-### 🔑 API Key Behavior
-
-- **With API Key**:
-  - Full access to all sensors
-  - Non-members may not exceed 6 data connections per minute
-- **Without API Key**:
-  - Limited to 3 sensor entities
-  - For evaluation or testing only
-  - Risk of IP ban
-
----
+This release targets **Home Assistant 2026.10 or later**. It uses HA's shared HTTP session and validation engine; NumPy is pinned to the version in the HA 2026.10 dependency constraints. Earlier HA releases are not declared supported by this package.
 
 ## Installation
 
-1. In HACS, go to **HACS > Integrations**.
-2. Click on **+ Explore & add custom repository**.
-3. Add the repository:
-   - **URL:** `https://github.com/jabbauer/PJM_Sensor`
-   - **Category:** Integration
-4. Search for **PJM Sensor** and install it (or update to **2.2.0**).
-5. Restart Home Assistant.
-6. Navigate to **Settings > Devices & Services** and add the **PJM Sensor** integration.
-7. In the configuration flow:
-   - **Select your utility zone.**
-   - **Enter your API key** (optional). Without an API key, you may become IP banned by PJM. Utilize for initial testing only.
-   - **Choose the sensor entities** you want to enable.
-     - By default, **instantaneous_total_load**, **total_short_forecast**, and **total_load_forecast** are selected.
-     - Without an API key, only up to 3 sensors can be selected.
-     - Per PJM, Non-members may not exceed 6 data connections per minute.
+Add `https://github.com/jabbauer/PJM_Sensor` as a custom integration repository in HACS, download it, and restart Home Assistant. For a manual install, copy **`custom_components/pjm`** into your HA configuration directory, then restart. The directory must be named `pjm`.
 
-Manual install: copy `custom_components/PJM_sensor` into your HA `config/custom_components/` folder and restart.
+Open **Settings → Devices & services → Add integration → PJM Sensor**. Choose your zone, optional PJM subscription key, and desired sensors. Without your own key, the form limits selection to three sensors. Saved option changes reload the integration automatically.
 
----
+If upgrading from an old manual install, back up your configuration and remove the obsolete `custom_components/PJM_sensor` code directory after installing the canonical `pjm` directory. Do not delete the integration's configuration entry or `.storage` files. Existing schema-1 entries migrate to schema 2, retaining sensors, zone, thresholds and API key. Schema-2 entries remain schema 2.
 
-## Upgrading from 2.1.6 → 2.2.0
+## Sensors
 
-### What stays the same
-- Same integration domain, sensors, and PJM API usage
-- Curtailment automations can keep using attribute **`peak_hour_active`** (still `true` / `false`)
-- Top-five peak history, forecasts, and config entry structure are unchanged
-- Your existing **peak threshold** values are **kept** until you reconfigure the integration
+- PJM system and zonal instantaneous load, in MW.
+- Daily and two-hour load forecasts.
+- Real-time zonal LMP, averaged over the requested feed rows, in $/MWh.
+- Day-ahead hourly LMP for supported transmission zones, in $/MWh.
+- Coincident-peak prediction sensors for the system and configured zone. Their numeric state is observed load; predictions and curtailment status are attributes.
 
-### What changes (behavior)
+## Peak-hour control
 
-| Topic | **2.1.6** | **2.2.0** |
-|--------|-----------|-----------|
-| When is `peak_hour_active` true? | On a high-risk day, during the **clock hour of the live predicted peak** (forecast can walk the hour later in the day) | On a high-risk day, via **Cover5CP**: prefers the true peak hour, waits rather than arming too early, aims not to arm **after** the peak, then usually **one hour** of active |
-| High-risk day | Predicted peak ≥ **95%** of max(threshold, 5th stored peak); can turn off mid-day if the forecast drops | ≥ **98%** of that bar; **sticky** once seen (stays high-risk for the rest of the day) |
-| Default thresholds (new installs only) | ~17k zone / 138k system (config flow sometimes used 16.5k / 140k) | **18,000** zone / **150,000** system |
-| After the peak / late reboot | Forecast could keep walking; reboot late in the evening could invent odd peaks | **Freeze** refine/arm when the afternoon peak reference is **more than 2 hours** past |
-| Diagnostics | Basic peak / ROC / bias attrs | Adds `saw_high_risk`, `cover5cp_armed`, `cover5cp_first_arm_h`, `prediction_time_locked`, `integration_version` (`grok_cover5cp_rc1`) |
+`peak_hour_active` is the curtailment signal. It is evaluated after load updates and by a separate hour-boundary callback using the latest available inputs. A late callback records its actual execution time; it cannot retroactively cover the beginning of an hour. Network, event-loop and downstream automation delays can still affect physical dispatch.
 
-### What you should expect after updating
-1. **Fewer “high risk” days** that are only loosely near the 5th peak (stricter 98% latch + higher defaults for new installs).
-2. **`peak_hour_active` may not match the predicted-peak hour** when the forecast walks later — Cover5CP can wait, then arm on-hour, or arm once and stay only that hour.
-3. **Fewer full misses** of the peak hour on hard days (offline board: stock late/miss ~29% vs Cover5CP **0%** on its HR set); possible **more single-hour early** arms (hard FP tradeoff).
-4. After a true peak, the entity should **stop chasing** a new evening prediction as aggressively (post-peak freeze).
+| Cover mode | Policy | Maximum policy span | Default daily elapsed-time cap |
+|---|---|---:|---:|
+| Secure | Prefer on-hour; mid-hour first activation permitted | First arm's clock hour, with existing lock behavior | 60 minutes |
+| Intermediate | Cover-first; normally first arms during minutes 0–6; conditional extension | Up to 2 clock hours | 120 minutes |
+| Reliable | Broader cover; less climb waiting; conditional extensions | Up to 3 clock hours | 120 minutes |
 
-### What you should do after updating
-1. Install **2.2.0**, restart Home Assistant.
-2. Confirm the coincident-peak entity shows `integration_version`: **`grok_cover5cp_rc1`**.
-3. Optionally open the integration options and set thresholds for your zone/system (recommended if you still have legacy 17k / 138k and want the 2026-oriented floors).
-4. Keep existing automations on `peak_hour_active`; re-test on the next hot day.
-5. No need to delete `.storage` peak history unless you are fixing a known bad top-five entry.
+The `max_daily_curtailment_minutes` option defaults to **120** and accepts 1–180 minutes. The effective cap is the smaller of that setting and the mode's 60/120/180-minute limit. Reliable can therefore use three hours only if you explicitly raise the daily setting. All active intervals, including lock reactivations, share the same elapsed-time allowance. The cap is per prediction entity, not a combined household or physical-device budget.
 
-### Plain-English: old vs new active window
-- **2.1.6:** “If today looks high-risk, turn active for whatever hour the **prediction currently points at**.”
-- **2.2.0:** “If today looks high-risk, turn active when Cover5CP thinks it’s the **right curtailment hour** — prefer on-hour, avoid late, limit multi-hour false runs.”
+Usage and first-arm information are checkpointed to HA storage and carried through reloads. After an interrupted active checkpoint, downtime is conservatively charged before a fresh decision is allowed. Corrupt/unreadable budget storage disables the signal for the remainder of that local day. Accounting resets at local midnight. HA must be running for timers to execute; your device automations remain responsible for device behavior during outages.
 
----
+Secure remains the setup and migration default. Intermediate is the preferred candidate for the two-hour objective based on our reconstructed-input simulations, not a guarantee of five-event capture. The 2.3.0 replay covered five of five observed proxy peak hours with aligned polling, but only three complete hours with a two-minute poll shift. Do not present those results as official settlement accuracy or measured 2.3.1 production performance.
 
-## 💡 Example: Load Curtailment Automation
+### Settings and attributes
 
-```yaml
-- alias: Curtail HVAC During PJM Peak
-  trigger:
-    - platform: state
-      entity_id: sensor.coincident_peak_prediction_system
-      attribute: peak_hour_active
-      to: "true"
-  action:
-    - service: climate.set_temperature
-      target:
-        entity_id: climate.house
-      data:
-        temperature: 78
+- Zonal/system peak threshold defaults: **18,000 / 150,000 MW**. Upgrades preserve previously saved thresholds.
+- High-risk factor: **0.98 × max(configured threshold, fifth stored peak)** when five peaks are present. A previously seen high-risk condition can remain latched during the day.
+- `cover_mode`, `high_risk_day`, `saw_high_risk`, `prediction_time_locked` explain policy state.
+- `actual_activation_time` is the actual most recent activation timestamp, separate from the legacy `predicted_peak_time` decision-hour label.
+- `curtailment_minutes_used` is usage accounted at the most recent decision; `max_daily_curtailment_minutes` is the effective cap.
+- `predicted_peak`, `observed_peak`, `observed_peak_time`, `top_five_peaks`, forecast derivatives and learning diagnostics remain available.
+- The five-peak history remains visible through December and resets on **January 1 in the Home Assistant time zone**. If HA is offline then, it catches up on the first update after restart. The reset marker is saved so reloading does not clear the current year's board again.
+- `integration_version` is `2.3.1`. Compatible learned-bias data retain their existing internal schema tag.
+
+## Day-ahead hourly prices
+
+The sensor fetches the HA local day's UTC window for the configured zone's mapped pricing node. **`hourly_prices`** is the authoritative list of `{start_utc, start_local, price}` intervals. It retains both repeated autumn hours and handles 23/25-hour days. Numeric attributes `0`–`23` are convenience views in the HA time zone; a missing or repeated hour is `null` rather than an invented average. The current state selects the matching UTC interval.
+
+**If a refresh fails or the current interval is missing, keep the last published price as the best available estimate.** `price_stale` then becomes true; `price_interval_start` and `price_as_of` retain that price's provenance. `as_of` describes the latest fetched curve, which can differ from the retained state's provenance. With no price ever received, the sensor is unavailable until it obtains one. The last numeric value is held in memory; persistence of that price across a Home Assistant restart is not provided.
+
+The new-day curve is fetched once complete, and incomplete curves are retried on subsequent polls. Day-ahead pricing is offered only for mapped supported zones, not the PJM-RTO aggregate. The setup form rejects unsupported combinations.
+
+## Experimental diagnostics
+
+`experimental_coincident_logic` defaults to false. When enabled, a shadow probability model exposes `*_experimental` attributes, persists its own weights/prior, and writes `pjm_pmf_shadow.jsonl` under the HA configuration directory with size-based rotation. It does **not** control production `peak_hour_active`. Keep experimental logging opt-in.
+
+## Development and validation
+
+Run offline regression checks with Python and NumPy installed:
+
+```sh
+python -m unittest discover -s tests -v
+python -m compileall -q custom_components/pjm
 ```
 
-## 💡 Example: Markdown Card Configuration
-```yaml
-  ### Five Coincident Peaks
-  {% for peak in state_attr('sensor.coincident_peak_prediction_pjm_rto', 'top_five_peaks') %}
-    {% set parts = peak.split(' - ') %}
-    {% set datetime = parts[0].strip() %}
-    {% set mw = parts[1].strip() %}
-  - **{{ mw }}** - {{ datetime }}
-  {% endfor %}
+The tests execute real source methods with deterministic HA/network adapters. They cover budget accounting, deadlines, restart/reload behavior, stale load, price time zones/DST, retained stale prices, HTTP failures, migration and metadata. They do not replace a clean HA install/upgrade test. The GitHub workflow adds package imports and form-schema checks on the declared minimum HA version; it must pass before a stable release is tagged.
 
- ### Predicted Peak
- {{ '{:,.0f}'.format(state_attr('sensor.coincident_peak_prediction_pjm_rto', 'predicted_peak')) }} MW
+Local research, historical snapshots, household exports and simulation results are excluded from Git by `.gitignore`. Release artifacts contain integration code and documentation, not those local datasets.
 
- ### Predicted Peak Time:  
-{% set ts = state_attr('sensor.coincident_peak_prediction_pjm_rto', 'predicted_peak_time') %}{{ as_datetime(ts).astimezone().strftime('%B %d, %Y, %-I:%M:%S %p') }}
-
- ### Observed Peak
- {{ '{:,.0f}'.format(state_attr('sensor.coincident_peak_prediction_pjm_rto', 'observed_peak')) }} MW
-
- ### Observed Peak Time:  
-{% set ts = state_attr('sensor.coincident_peak_prediction_pjm_rto', 'observed_peak_time') %}{{ as_datetime(ts).astimezone().strftime('%B %d, %Y, %-I:%M:%S %p') }}
-```
-
----
-
-## Historic board (controller grade, offline)
-
-Replay on the 2026 summer development board (same forecast Sim path for both policies):
-
-| Policy | HR days | Cover `[act−2,act]` | On-hour | Late+miss | Early&gt;2h |
-|--------|--------:|--------------------:|--------:|----------:|-----------:|
-| **2.1.6 stock** (pred-hour active, HR @ 0.95) | 14 | 64% | 50% | 29% | 7% |
-| **2.2.0 Cover5CP** (HR @ 0.98 sticky) | 12 | **100%** | **83%** | **0%** | **0%** |
-| Morning DA (on Cover HR set) | 12 | 83% | 58% | 8% | 8% |
-
-Head-to-head on shared HR days: Cover better **4**, stock better **0**, ties **8**.
-
-Official-style (score_day on HR rows): Cover good **~67%** vs stock **~50%** (Cover trades some hard-FP for far fewer misses).
-
----
-
-## Changelog
-
-### 2.2.0
-- **Cover5CP** `peak_hour_active` policy (prefer on-hour + cover safety; sticky HR; single-hour active)
-- High-risk fraction **0.98** (was 0.95)
-- Default peak thresholds **18,000 / 150,000 MW** (was 17k / 138k)
-- Post-peak freeze at **peak reference + 2 hours** (reboot hygiene; no fixed 20:00)
-- hr90-style operational lock (path-A, short-not-later)
-- Diagnostics: `cover5cp_*`, `saw_high_risk`, `integration_version`
-- Improved bias learning from decision-hour snapshots (not post-lock frozen pred)
-
-### 2.1.6
-- Fixed: Resolved AttributeError: `_last_reset_date` crash on startup by initializing peak history dates immediately.
-
----
-
-## Disclaimer
-
-This integration is not affiliated with, nor supported by, PJM or any PJM member. Use at your own risk. Data from PJM's DataMiner 2 API is for internal use only. Redistribution of this data or any derivative information is prohibited unless you are a PJM member.
+See [CHANGELOG.md](CHANGELOG.md) for the 2.3.1 changes.

@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+.testdeps/
+# Local research snapshots, household exports, and analysis stay on this machine.
+/analysis/
+/data/
+/dist/
+pjm_pmf_shadow.jsonl*
+.pytest_cache/
